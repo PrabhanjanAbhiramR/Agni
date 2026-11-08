@@ -1,0 +1,242 @@
+{
+  "name": "forge-agent",
+  "displayName": "Agni",
+  "description": "A TrueForge-powered VS Code coding agent with secure workspace tools and reviewed code edits.",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PrabhanjanAbhiramR/Agni.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PrabhanjanAbhiramR/Agni/issues"
+  },
+  "homepage": "https://github.com/PrabhanjanAbhiramR/Agni#readme",
+  "type": "module",
+  "engines": {
+    "vscode": "^1.144.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:agni.testTrueForgeConnection",
+    "onCommand:agni.testWorkspaceTools",
+    "onCommand:agni.testTrueForgeWorkspaceAgent",
+    "onCommand:agni.inlineEdit",
+    "onCommand:agni.inlineEdit.accept",
+    "onCommand:agni.inlineEdit.reject",
+    "onCommand:agni.multiFileEdit",
+    "onCommand:agni.multiFileEdit.accept",
+    "onCommand:agni.multiFileEdit.reject",
+    "onCommand:agni.multiFileEdit.undo",
+    "onCommand:agni.multiFileEdit.applyReviewed",
+    "onCommand:agni.multiFileEdit.acceptFile",
+    "onCommand:agni.multiFileEdit.rejectFile",
+    "onCommand:agni.multiFileEdit.acceptHunk",
+    "onCommand:agni.multiFileEdit.rejectHunk",
+    "onCommand:agni.multiFileEdit.openReviewFile"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agni.testTrueForgeConnection",
+        "title": "Agni: Test TrueForge Connection"
+      },
+      {
+        "command": "agni.testWorkspaceTools",
+        "title": "Agni: Test Workspace Tools"
+      },
+      {
+        "command": "agni.testTrueForgeWorkspaceAgent",
+        "title": "Agni: Test TrueForge Workspace Agent"
+      },
+      {
+        "command": "agni.inlineEdit",
+        "title": "Agni: Inline Edit"
+      },
+      {
+        "command": "agni.inlineEdit.accept",
+        "title": "Agni: Accept Inline Edit",
+        "enablement": "agni.hasInlineEditProposal"
+      },
+      {
+        "command": "agni.inlineEdit.reject",
+        "title": "Agni: Reject Inline Edit",
+        "enablement": "agni.hasInlineEditProposal"
+      },
+      {
+        "command": "agni.multiFileEdit",
+        "title": "Agni: Multi-File Edit"
+      },
+      {
+        "command": "agni.multiFileEdit.accept",
+        "title": "Agni: Accept All Multi-File Changes",
+        "enablement": "agni.hasMultiFileProposal"
+      },
+      {
+        "command": "agni.multiFileEdit.reject",
+        "title": "Agni: Reject Multi-File Edit",
+        "enablement": "agni.hasMultiFileProposal"
+      },
+      {
+        "command": "agni.multiFileEdit.undo",
+        "title": "Agni: Undo Last Multi-File Edit",
+        "enablement": "agni.canUndoMultiFileEdit"
+      },
+      {
+        "command": "agni.multiFileEdit.applyReviewed",
+        "title": "Agni: Apply Reviewed Changes",
+        "enablement": "agni.canApplyMultiFileReview"
+      },
+      {
+        "command": "agni.multiFileEdit.acceptFile",
+        "title": "Accept File",
+        "enablement": "agni.hasMultiFileProposal",
+        "icon": "$(check)"
+      },
+      {
+        "command": "agni.multiFileEdit.rejectFile",
+        "title": "Reject File",
+        "enablement": "agni.hasMultiFileProposal",
+        "icon": "$(close)"
+      },
+      {
+        "command": "agni.multiFileEdit.acceptHunk",
+        "title": "Accept Hunk",
+        "enablement": "agni.hasMultiFileProposal",
+        "icon": "$(check)"
+      },
+      {
+        "command": "agni.multiFileEdit.rejectHunk",
+        "title": "Reject Hunk",
+        "enablement": "agni.hasMultiFileProposal",
+        "icon": "$(close)"
+      },
+      {
+        "command": "agni.multiFileEdit.openReviewFile",
+        "title": "Open File Diff",
+        "enablement": "agni.hasMultiFileProposal",
+        "icon": "$(diff)"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "agni.multiFileReview",
+          "name": "Agni Review"
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "agni.inlineEdit",
+          "when": "editorHasSelection",
+          "group": "1_modification@50"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "agni.multiFileEdit.acceptFile",
+          "when": "view == agni.multiFileReview && viewItem == agniMultiFileReviewFile",
+          "group": "inline@1"
+        },
+        {
+          "command": "agni.multiFileEdit.rejectFile",
+          "when": "view == agni.multiFileReview && viewItem == agniMultiFileReviewFile",
+          "group": "inline@2"
+        },
+        {
+          "command": "agni.multiFileEdit.acceptHunk",
+          "when": "view == agni.multiFileReview && viewItem == agniMultiFileReviewHunk",
+          "group": "inline@1"
+        },
+        {
+          "command": "agni.multiFileEdit.rejectHunk",
+          "when": "view == agni.multiFileReview && viewItem == agniMultiFileReviewHunk",
+          "group": "inline@2"
+        },
+        {
+          "command": "agni.multiFileEdit.openReviewFile",
+          "when": "view == agni.multiFileReview",
+          "group": "navigation@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "agni.multiFileEdit.acceptFile",
+          "when": "false"
+        },
+        {
+          "command": "agni.multiFileEdit.rejectFile",
+          "when": "false"
+        },
+        {
+          "command": "agni.multiFileEdit.acceptHunk",
+          "when": "false"
+        },
+        {
+          "command": "agni.multiFileEdit.rejectHunk",
+          "when": "false"
+        },
+        {
+          "command": "agni.multiFileEdit.openReviewFile",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Agni",
+      "properties": {
+        "agni.trueForge.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:8790",
+          "description": "Base URL of the TrueForge agent runtime used by Agni."
+        },
+        "agni.trueForge.selectedModel": {
+          "type": "string",
+          "default": "",
+          "description": "Preferred configured TrueForge model FQN to preselect in the model picker."
+        },
+        "agni.context.maxBytes": {
+          "type": "number",
+          "default": 131072,
+          "minimum": 1024,
+          "maximum": 1048576,
+          "description": "Maximum UTF-8 byte size of explicit @file/@symbol context plus automatically retrieved code for one Agni turn. Explicit references have priority and fail clearly if they cannot fit; automatic snippets are included whole and budget omissions are reported."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "@types/vscode": "^1.144.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
+    "eslint": "^10.5.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/node": "2.1.2",
+    "@modelcontextprotocol/server": "2.4.0",
+    "@truefoundry/trueforge-sdk": "0.184.0",
+    "diff": "^8.0.4",
+    "zod": "4.6.6"
+  }
+}
