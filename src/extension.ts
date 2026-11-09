@@ -4,8 +4,8 @@ import { AgniMcpHttpHost } from './mcp/httpMcpHost.js';
 import { agniWorkspaceToolNames } from './mcp/agniMcpServer.js';
 import {
 	agniWorkspaceConnectorName,
-	registerWorkspaceConnector,
 	runWorkspaceAgentTurn,
+	startAndRegisterWorkspaceConnector,
 	verifyWorkspaceConnectorTools,
 } from './trueforge/workspaceAgent.js';
 import { defaultContextBudgetBytes } from './context/contextAssembler.js';
@@ -43,6 +43,7 @@ import {
 } from './multiFileEdit/multiFileProposal.js';
 import {
 	MultiFileEditCancelledError,
+	type MultiFileToolApprovalRequest,
 	runMultiFileAgentTurn,
 	verifyMultiFileConnectorTools,
 } from './trueforge/multiFileEditAgent.js';
@@ -292,15 +293,9 @@ async function runTrueForgeWorkspaceTest(
 
 	outputChannel.appendLine(`Model: ${selectedModel.modelFqn}`);
 	outputChannel.appendLine('Starting authenticated workspace MCP endpoint...');
-	const endpoint = await mcpHost.start();
+	const endpoint = await startAndRegisterWorkspaceConnector(client, mcpHost);
 	outputChannel.appendLine(`MCP endpoint: http://127.0.0.1:${endpoint.port}/mcp`);
-	outputChannel.appendLine(`Registering TrueForge connector: ${agniWorkspaceConnectorName}`);
-	try {
-		await registerWorkspaceConnector(client, mcpHost);
-	} catch (error: unknown) {
-		await showFailure(outputChannel, 'Failed to register the Agni MCP connector with TrueForge', error);
-		return;
-	}
+	outputChannel.appendLine(`Registered TrueForge connector: ${agniWorkspaceConnectorName}`);
 
 	outputChannel.appendLine('Verifying connector tool discovery through TrueForge...');
 	try {
@@ -377,9 +372,13 @@ async function runWorkspaceToolsTest(
 	outputChannel.show(true);
 	outputChannel.appendLine('Agni: Workspace tools test');
 	outputChannel.appendLine('Starting authenticated MCP server...');
-	const endpoint = await mcpHost.start();
+	const configuration = vscode.workspace.getConfiguration(configurationSection);
+	const serverUrl = configuration.get<string>('serverUrl', defaultServerUrl).trim() || defaultServerUrl;
+	const client = new TrueForge({ baseUrl: serverUrl, timeoutInSeconds: 600 });
+	const endpoint = await startAndRegisterWorkspaceConnector(client, mcpHost);
 	outputChannel.appendLine(`MCP endpoint: ${endpoint.url}`);
 	outputChannel.appendLine('Authentication: ephemeral bearer token enabled');
+	outputChannel.appendLine(`Registered TrueForge connector: ${agniWorkspaceConnectorName}`);
 	outputChannel.appendLine('Requesting tools/list...');
 
 	const exposedTools = await mcpHost.listToolNames();
@@ -501,6 +500,34 @@ async function undoLastMultiFileEdit(controller: MultiFileEditController): Promi
 	);
 }
 
+async function requestProposeWriteApproval(
+	request: MultiFileToolApprovalRequest,
+	outputChannel: vscode.OutputChannel,
+	cancellationToken: vscode.CancellationToken,
+): Promise<{ status: 'allow' } | { reason: string; status: 'deny' }> {
+	const action = await vscode.window.showWarningMessage(
+		`Agni wants permission to run ${request.toolName} and generate a workspace file-change proposal. `
+		+ 'This only records a proposal for per-file and per-hunk review; it does not write any file.',
+		'Allow Proposal',
+		'Deny',
+	);
+	if (cancellationToken.isCancellationRequested) {
+		return { reason: 'Multi-file edit generation was cancelled.', status: 'deny' };
+	}
+	if (action === 'Allow Proposal') {
+		outputChannel.appendLine(`[Tool approval: allowed ${request.toolName}]`);
+		return { status: 'allow' };
+	}
+
+	outputChannel.appendLine(`[Tool approval: denied ${request.toolName}]`);
+	return {
+		reason: action === 'Deny'
+			? 'The user denied permission to generate this file-change proposal.'
+			: 'The user dismissed the file-change proposal approval request.',
+		status: 'deny',
+	};
+}
+
 async function runMultiFileEdit(
 	outputChannel: vscode.OutputChannel,
 	mcpHost: AgniMcpHttpHost,
@@ -554,8 +581,7 @@ async function runMultiFileEdit(
 	outputChannel.appendLine('Agni: Multi-file edit');
 	outputChannel.appendLine(`Model: ${selectedModel.modelFqn}`);
 	outputChannel.appendLine('Starting authenticated proposal-only MCP tools...');
-	await mcpHost.start();
-	await registerWorkspaceConnector(client, mcpHost);
+	await startAndRegisterWorkspaceConnector(client, mcpHost);
 	await verifyMultiFileConnectorTools(client);
 
 	const transaction = controller.store.begin(task);
@@ -574,6 +600,11 @@ async function runMultiFileEdit(
 			{
 				onContextAssembled: (bytes) => outputChannel.appendLine(`[Context: ${bytes} bytes]`),
 				onText: (content) => outputChannel.append(content),
+				onToolApprovalRequired: (request) => requestProposeWriteApproval(
+					request,
+					outputChannel,
+					cancellationToken,
+				),
 				onTurnDone: (status) => outputChannel.appendLine(`\nTurn status: ${status}`),
 			},
 			undefined,
@@ -776,7 +807,30 @@ async function runInlineEdit(
 	}
 }
 
-export function activate(context: vscode.ExtensionContext): void {
+async function registerWorkspaceConnectorForCurrentExtensionHost(
+	outputChannel: vscode.OutputChannel,
+	mcpHost: AgniMcpHttpHost,
+): Promise<void> {
+	if (!vscode.workspace.isTrusted || !vscode.workspace.workspaceFolders?.length) {
+		return;
+	}
+
+	const configuration = vscode.workspace.getConfiguration(configurationSection);
+	const serverUrl = configuration.get<string>('serverUrl', defaultServerUrl).trim() || defaultServerUrl;
+	const client = new TrueForge({ baseUrl: serverUrl, timeoutInSeconds: 15 });
+	try {
+		const endpoint = await startAndRegisterWorkspaceConnector(client, mcpHost);
+		outputChannel.appendLine(
+			`[MCP] Registered ${agniWorkspaceConnectorName} for this Extension Host at ${endpoint.url}.`,
+		);
+	} catch (error: unknown) {
+		const details = describeError(error);
+		outputChannel.appendLine(`[MCP] Connector registration deferred: ${details}`);
+		console.warn(`[Agni] MCP connector registration deferred: ${details}`);
+	}
+}
+
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	const outputChannel = vscode.window.createOutputChannel('Agni');
 	const multiFileStore = new MultiFileProposalStore();
 	const multiFileDiffProvider = new MultiFileDiffProvider(multiFileStore);
@@ -1055,6 +1109,8 @@ export function activate(context: vscode.ExtensionContext): void {
 		rejectMultiFileHunkCommand,
 		openMultiFileReviewCommand,
 	);
+
+	await registerWorkspaceConnectorForCurrentExtensionHost(outputChannel, mcpHost);
 }
 
 export async function deactivate(): Promise<void> {

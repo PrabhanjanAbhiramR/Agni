@@ -1,7 +1,7 @@
 import { TrueForge, type TrueForgeApi } from '@truefoundry/trueforge-sdk';
 import { ContextAssembler, defaultContextBudgetBytes } from '../context/contextAssembler.js';
 import { agniWorkspaceToolNames } from '../mcp/agniMcpServer.js';
-import { AgniMcpHttpHost } from '../mcp/httpMcpHost.js';
+import { AgniMcpHttpHost, type AgniMcpEndpoint } from '../mcp/httpMcpHost.js';
 
 export const agniWorkspaceConnectorName = 'agni-vscode-workspace';
 
@@ -106,6 +106,19 @@ export async function registerWorkspaceConnector(
 	} catch (error: unknown) {
 		throw connectorRegistrationError(error, authorization);
 	}
+}
+
+/**
+ * Start the current Extension Host's ephemeral MCP endpoint and immediately
+ * replace TrueForge's persisted connector settings with its URL and token.
+ */
+export async function startAndRegisterWorkspaceConnector(
+	client: TrueForge,
+	mcpHost: AgniMcpHttpHost,
+): Promise<AgniMcpEndpoint> {
+	const endpoint = await mcpHost.start();
+	await registerWorkspaceConnector(client, mcpHost);
+	return endpoint;
 }
 
 export async function verifyWorkspaceConnectorTools(client: TrueForge): Promise<string[]> {

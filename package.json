@@ -20,6 +20,7 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onCommand:agni.testTrueForgeConnection",
     "onCommand:agni.testWorkspaceTools",
     "onCommand:agni.testTrueForgeWorkspaceAgent",
@@ -214,6 +215,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "register:agent": "npm run compile && node trueforge/register-agent.mjs",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test"

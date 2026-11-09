@@ -39,7 +39,11 @@ suite('TrueForge workspace agent configuration', () => {
 			enableTools: [...agniMultiFileToolNames],
 			name: agniWorkspaceConnectorName,
 			preload: true,
-			requireApprovalForTools: [],
+			requireApprovalForTools: ['propose_write'],
 		}]);
+		assert.deepStrictEqual(spec.mcpServers?.[0]?.requireApprovalForTools, ['propose_write']);
+		assert.ok(!spec.mcpServers?.[0]?.requireApprovalForTools?.includes('read_file'));
+		assert.ok(!spec.mcpServers?.[0]?.requireApprovalForTools?.includes('list_files'));
+		assert.ok(!spec.mcpServers?.[0]?.requireApprovalForTools?.includes('search_code'));
 	});
 });

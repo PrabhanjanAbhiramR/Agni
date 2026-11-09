@@ -21,6 +21,59 @@ Agni does not write files while TrueForge is generating a proposal. Accepted edi
 
 Agni routes model operations through TrueForge and does not call Gemini or another model provider directly.
 
+## Standalone TrueForge agent definition
+
+[`trueforge/agni-agent.json`](trueforge/agni-agent.json) is a standalone,
+serializable `CreateAgentRequest` for the named agent
+`agni-vscode-workspace-agent`. It contains no provider credentials, MCP bearer
+token, or ephemeral MCP URL. Its connector reference is the stable
+`agni-vscode-workspace` name registered by the running extension.
+
+The checked-in model value is deliberately the non-runnable placeholder
+`<configured-model-fqn>`. [`trueforge/model.example.json`](trueforge/model.example.json)
+shows the credential-free server URL and model-FQN inputs used for registration.
+Configure provider credentials in the local TrueForge server, never in this
+repository.
+
+To register or update the named agent:
+
+1. Start the local TrueForge server and configure a model in it.
+2. Run **Agni: Test TrueForge Connection** and copy the exact model FQN shown by
+   `client.models.list()`; do not substitute a provider model ID or guess an
+   identifier.
+3. In PowerShell, set the model FQN and, if necessary, the server URL for the
+   current terminal process:
+
+   ```powershell
+   $env:AGNI_TRUEFORGE_MODEL = '<exact-configured-model-fqn>'
+   $env:AGNI_TRUEFORGE_SERVER_URL = 'http://localhost:8790'
+   npm run register:agent
+   ```
+
+   `AGNI_TRUEFORGE_SERVER_URL` is optional and defaults to
+   `http://localhost:8790`. `AGNI_TRUEFORGE_MODEL` is required. The registration
+   utility uses the public `client.agents.create()` or `client.agents.update()`
+   SDK APIs and never configures a model provider.
+
+4. Launch the Agni Extension Development Host before using workspace tools.
+   On activation, the extension starts an authenticated loopback MCP endpoint
+   and replaces the TrueForge connector named `agni-vscode-workspace` with that
+   process's ephemeral URL and bearer credential. The endpoint remains alive
+   until that Extension Host stops. Running **Agni: Test Workspace Tools** also
+   refreshes the connector registration if TrueForge became available later.
+
+A separately created session may reference the registered definition with:
+
+```ts
+await client.sessions.create({
+  agent: { name: 'agni-vscode-workspace-agent' },
+});
+```
+
+Agni's existing extension commands continue to create their current inline
+agent specifications. Registering the standalone definition does not switch or
+modify those runtime flows.
+
 ## Commands
 
 - `Agni: Test TrueForge Connection`
