@@ -26,6 +26,7 @@ export interface RelevantCodeTerm {
 
 export interface AutomaticCodeSnippet {
 	endLine: number;
+	matchedTerms: string[];
 	path: string;
 	root: string;
 	score: number;
@@ -141,8 +142,14 @@ function snippetsForFile(
 		const endLine = Math.min(lines.length, line + surroundingLines);
 		const text = lines.slice(startLine - 1, endLine).join('\n');
 		const lineScore = scoreLine(matchesByLine.get(line) ?? [], terms);
+		const lineTerms = new Set(
+			(matchesByLine.get(line) ?? []).map((match) => match.term.toLocaleLowerCase()),
+		);
 		return {
 			endLine,
+			matchedTerms: [...terms.values()]
+				.filter((term) => lineTerms.has(term.value.toLocaleLowerCase()))
+				.map((term) => term.value),
 			path: file.path,
 			root: file.root,
 			score: fileScore + lineScore,

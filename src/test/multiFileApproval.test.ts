@@ -9,6 +9,7 @@ import {
 import {
 	MultiFileEditCancelledError,
 	runMultiFileAgentTurn,
+	type MultiFileToolActivity,
 	type MultiFileToolApprovalRequest,
 } from '../trueforge/multiFileEditAgent.js';
 
@@ -128,17 +129,22 @@ function toolResponse(
 	};
 }
 
-function readOnlyMessage(messageId: string, toolCallId: string): TrueForgeApi.ModelMessageEvent {
+function readOnlyMessage(
+	messageId: string,
+	toolCallId: string,
+	toolName = 'read_file',
+	argumentsJson = '{"path":"package.json"}',
+): TrueForgeApi.ModelMessageEvent {
 	return {
 		content: null,
 		createdAt,
 		id: messageId,
 		threadId: 'main',
 		toolCalls: [{
-			function: { arguments: '{"path":"package.json"}', name: 'call_tool' },
+			function: { arguments: argumentsJson, name: 'call_tool' },
 			id: toolCallId,
 			toolInfo: {
-				name: 'read_file',
+				name: toolName,
 				serverId: 'mcp-server-id',
 				serverName: 'agni-vscode-workspace',
 				type: 'mcp',
@@ -146,6 +152,29 @@ function readOnlyMessage(messageId: string, toolCallId: string): TrueForgeApi.Mo
 			type: 'function',
 		}],
 		type: 'model.message',
+	};
+}
+
+function readOnlyDelta(
+	eventId: string,
+	toolCallId: string,
+	toolName: string,
+): TrueForgeApi.ModelMessageDeltaEvent {
+	return {
+		id: eventId,
+		threadId: 'main',
+		toolCalls: [{
+			id: toolCallId,
+			index: 0,
+			toolInfo: {
+				name: toolName,
+				serverId: 'mcp-server-id',
+				serverName: 'agni-vscode-workspace',
+				type: 'mcp',
+			},
+			type: 'function',
+		}],
+		type: 'model.message.delta',
 	};
 }
 
@@ -241,6 +270,9 @@ suite('TrueForge propose_write approval flow', () => {
 			},
 		]);
 		const requests: MultiFileToolApprovalRequest[] = [];
+		const toolActivity: MultiFileToolActivity[] = [];
+		let assembledContextBytes: number | undefined;
+		let createdSessionId: string | undefined;
 		const result = await runMultiFileAgentTurn(
 			scripted.client,
 			'model/fqn',
@@ -249,6 +281,9 @@ suite('TrueForge propose_write approval flow', () => {
 			store,
 			new vscode.CancellationTokenSource().token,
 			{
+				onContextDetails: (context) => { assembledContextBytes = context.byteLength; },
+				onSessionCreated: (sessionId) => { createdSessionId = sessionId; },
+				onToolActivity: (activity) => { toolActivity.push(activity); },
 				onToolApprovalRequired: async (request) => {
 					requests.push(request);
 					return { status: 'allow' };
@@ -271,8 +306,126 @@ suite('TrueForge propose_write approval flow', () => {
 		assert.strictEqual(result.transaction.status, 'review');
 		assert.strictEqual(result.transaction.changes.size, 1);
 		assert.strictEqual(result.answer, 'Proposal prepared.');
+		assert.strictEqual(assembledContextBytes, 0);
+		assert.strictEqual(createdSessionId, 'approval-session');
+		assert.deepStrictEqual(toolActivity, [
+			{ status: 'started', toolName: 'read_file' },
+			{ status: 'completed', toolName: 'read_file' },
+			{ status: 'started', toolName: 'propose_write' },
+			{ status: 'awaiting-approval', toolName: 'propose_write' },
+			{ status: 'completed', toolName: 'propose_write' },
+		]);
+		assert.doesNotMatch(JSON.stringify(toolActivity), /package\.json|approved = true|src\/approved/u);
 		assert.strictEqual(scripted.cancelCount(), 0);
 		assert.strictEqual(store.getLastAppliedBatch(), undefined);
+	});
+
+	test('cancels the session once when the session-created callback fails', async () => {
+		const store = new MultiFileProposalStore();
+		begin(store, 'session-callback-failure');
+		const scripted = createScriptedClient([]);
+
+		await assert.rejects(runMultiFileAgentTurn(
+			scripted.client,
+			'model/fqn',
+			'Prepare a reviewed change.',
+			'session-callback-failure',
+			store,
+			new vscode.CancellationTokenSource().token,
+			{
+				onSessionCreated: () => {
+					throw new Error('Session callback failed.');
+				},
+			},
+			assembler(),
+		), /Session callback failed/u);
+
+		assert.strictEqual(scripted.cancelCount(), 1);
+		assert.strictEqual(scripted.requests.length, 0);
+		assert.strictEqual(store.require('session-callback-failure').status, 'cancelled');
+		assert.strictEqual(store.getLastAppliedBatch(), undefined);
+	});
+
+	test('reports only safe activity for read-only and proposal tools', async () => {
+		const store = new MultiFileProposalStore();
+		begin(store, 'safe-tool-activity');
+		const proposedContent = 'export const safeActivity = true;\n';
+		const pending = approvalRequired('approval-safe-activity', 'message-proposal', ['call-proposal']);
+		const malformed = readOnlyMessage(
+			'message-malformed',
+			'call-malformed',
+			'read_file',
+			'{"path":"do-not-leak-malformed.ts"}',
+		);
+		malformed.toolCalls = malformed.toolCalls?.map((call) => {
+			const { toolInfo: _toolInfo, ...withoutToolInfo } = call;
+			return withoutToolInfo as TrueForgeApi.ToolCall;
+		});
+		const scripted = createScriptedClient([
+			{
+				events: [
+					turnCreated('turn-safe-activity-1'),
+					readOnlyMessage('message-read', 'call-read', 'read_file', '{"path":"do-not-leak-read.ts"}'),
+					toolResponse('response-read', 'call-read', 'do-not-leak-read-response.ts'),
+					readOnlyMessage('message-list', 'call-list', 'list_files', '{"glob":"do-not-leak-list/**"}'),
+					toolResponse('response-list', 'call-list', 'do-not-leak-list-response.ts'),
+					readOnlyDelta('delta-search', 'call-search', 'search_code'),
+					toolResponse('response-search', 'call-search', 'do-not-leak-search-response.ts'),
+					readOnlyMessage('message-unknown', 'call-unknown', 'unknown_tool', '{"secret":"do-not-leak"}'),
+					toolResponse('response-unknown', 'call-unknown', 'do-not-leak-unknown-response.ts'),
+					malformed,
+					toolResponse('response-malformed', 'call-malformed', 'do-not-leak-malformed-response.ts'),
+					proposalMessage('message-proposal', [proposalCall(
+						'call-proposal',
+						'src/safe-activity.ts',
+						proposedContent,
+					)]),
+					pending,
+					turnDone('done-safe-activity-1', [pending]),
+				],
+			},
+			{
+				onCreate: () => addProposal(store, 'src/safe-activity.ts', proposedContent),
+				events: [
+					turnCreated('turn-safe-activity-2', 'turn-safe-activity-1'),
+					toolResponse('response-proposal', 'call-proposal', 'src/safe-activity.ts'),
+					turnDone('done-safe-activity-2'),
+				],
+			},
+		]);
+		const activity: MultiFileToolActivity[] = [];
+
+		await runMultiFileAgentTurn(
+			scripted.client,
+			'model/fqn',
+			'Prepare a reviewed change.',
+			'safe-tool-activity',
+			store,
+			new vscode.CancellationTokenSource().token,
+			{
+				onToolActivity: (item) => { activity.push(item); },
+				onToolApprovalRequired: async () => ({ status: 'allow' }),
+			},
+			assembler(),
+		);
+
+		assert.deepStrictEqual(activity, [
+			{ status: 'started', toolName: 'read_file' },
+			{ status: 'completed', toolName: 'read_file' },
+			{ status: 'started', toolName: 'list_files' },
+			{ status: 'completed', toolName: 'list_files' },
+			{ status: 'started', toolName: 'search_code' },
+			{ status: 'completed', toolName: 'search_code' },
+			{ status: 'started', toolName: 'propose_write' },
+			{ status: 'awaiting-approval', toolName: 'propose_write' },
+			{ status: 'completed', toolName: 'propose_write' },
+		]);
+		assert.doesNotMatch(
+			JSON.stringify(activity),
+			/do-not-leak|unknown_tool|safe-activity\.ts|safeActivity/u,
+		);
+		assert.strictEqual(store.require('safe-tool-activity').status, 'review');
+		assert.strictEqual(scripted.cancelCount(), 0);
 	});
 
 	test('rejects duplicate propose_write execution responses', async () => {

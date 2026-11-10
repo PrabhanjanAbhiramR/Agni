@@ -53,7 +53,7 @@ export interface AssembledContext {
 
 export interface AutomaticContextSummary {
 	candidateCount: number;
-	included: Array<Pick<AutomaticCodeSnippet, 'endLine' | 'path' | 'root' | 'score' | 'startLine'>>;
+	included: Array<Pick<AutomaticCodeSnippet, 'endLine' | 'matchedTerms' | 'path' | 'root' | 'score' | 'startLine'>>;
 	omittedForBudget: number;
 	omittedByRanking: number;
 	skippedFiles: number;
@@ -253,6 +253,7 @@ export class ContextAssembler {
 			automaticStarted = true;
 			included.push({
 				endLine: snippet.endLine,
+				matchedTerms: snippet.matchedTerms,
 				path: snippet.path,
 				root: snippet.root,
 				score: snippet.score,

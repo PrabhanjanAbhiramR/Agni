@@ -244,6 +244,10 @@ suite('Context assembler', () => {
 		const result = await assembler.assemble('Fix authenticateUser token validation failure', 8192);
 
 		assert.strictEqual(result.automatic.included[0]?.path, 'src/authService.ts');
+		assert.deepStrictEqual(result.automatic.included[0]?.matchedTerms, [
+			'authenticateUser',
+			'token',
+		]);
 		assert.match(result.content, /const normalized = token\.trim\(\)/u);
 		assert.match(result.content, /return loadUser\(normalized\)/u);
 	});

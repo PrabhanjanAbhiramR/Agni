@@ -36,7 +36,8 @@
     "onCommand:agni.multiFileEdit.rejectFile",
     "onCommand:agni.multiFileEdit.acceptHunk",
     "onCommand:agni.multiFileEdit.rejectHunk",
-    "onCommand:agni.multiFileEdit.openReviewFile"
+    "onCommand:agni.multiFileEdit.openReviewFile",
+    "onView:agni.agentPanel"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -124,6 +125,11 @@
     ],
     "views": {
       "explorer": [
+        {
+          "type": "webview",
+          "id": "agni.agentPanel",
+          "name": "Agni Agent"
+        },
         {
           "id": "agni.multiFileReview",
           "name": "Agni Review"

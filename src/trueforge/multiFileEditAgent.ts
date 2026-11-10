@@ -5,7 +5,11 @@ import {
 	type TrueForgeApi,
 } from '@truefoundry/trueforge-sdk';
 import * as vscode from 'vscode';
-import { ContextAssembler, defaultContextBudgetBytes } from '../context/contextAssembler.js';
+import {
+	type AssembledContext,
+	ContextAssembler,
+	defaultContextBudgetBytes,
+} from '../context/contextAssembler.js';
 import { agniMultiFileToolNames } from '../mcp/agniMcpServer.js';
 import {
 	contentHash,
@@ -18,7 +22,10 @@ import { agniWorkspaceConnectorName, buildWorkspaceTurnInput } from './workspace
 
 export interface MultiFileAgentProgress {
 	onContextAssembled?: (byteLength: number) => void;
+	onContextDetails?: (context: AssembledContext) => void;
+	onSessionCreated?: (sessionId: string) => void;
 	onText?: (content: string) => void;
+	onToolActivity?: (activity: MultiFileToolActivity) => void;
 	onToolApprovalRequired?: (
 		request: MultiFileToolApprovalRequest,
 	) => Promise<TrueForgeApi.ApprovalDecision>;
@@ -26,6 +33,14 @@ export interface MultiFileAgentProgress {
 }
 
 export const proposeWriteToolName = 'propose_write';
+
+export type MultiFileToolName = (typeof agniMultiFileToolNames)[number];
+export type MultiFileToolActivityStatus = 'awaiting-approval' | 'completed' | 'started';
+
+export interface MultiFileToolActivity {
+	status: MultiFileToolActivityStatus;
+	toolName: MultiFileToolName;
+}
 
 export interface MultiFileToolApprovalRequest {
 	arguments: string;
@@ -91,12 +106,134 @@ interface ProposalToolResult {
 	root: string;
 }
 
+interface PendingActivityToolCall {
+	id?: string;
+	serverName?: string;
+	toolName?: string;
+}
+
 function approvalKey(threadId: string, toolCallId: string): string {
 	return `${threadId}\0${toolCallId}`;
 }
 
 function proposalExecutionKey(sessionId: string, threadId: string, toolCallId: string): string {
 	return `${sessionId}\0${threadId}\0${toolCallId}`;
+}
+
+function isAgniMultiFileToolName(name: string | undefined): name is MultiFileToolName {
+	return name !== undefined && agniMultiFileToolNames.some((toolName) => toolName === name);
+}
+
+function toolActivityKey(threadId: string, toolCallId: string): string {
+	return `${threadId}\0${toolCallId}`;
+}
+
+function reportToolActivity(
+	toolName: MultiFileToolName,
+	status: MultiFileToolActivityStatus,
+	callKey: string,
+	reported: Set<string>,
+	progress: MultiFileAgentProgress,
+): void {
+	const reportKey = `${callKey}\0${status}`;
+	if (reported.has(reportKey)) {
+		return;
+	}
+	reported.add(reportKey);
+	progress.onToolActivity?.({ status, toolName });
+}
+
+function recordToolActivityCall(
+	threadId: string,
+	toolCallId: string | undefined,
+	toolName: string | undefined,
+	serverName: string | undefined,
+	calls: Map<string, MultiFileToolName>,
+	reported: Set<string>,
+	progress: MultiFileAgentProgress,
+): void {
+	if (!toolCallId
+		|| serverName !== agniWorkspaceConnectorName
+		|| !isAgniMultiFileToolName(toolName)) {
+		return;
+	}
+	const callKey = toolActivityKey(threadId, toolCallId);
+	calls.set(callKey, toolName);
+	reportToolActivity(toolName, 'started', callKey, reported, progress);
+}
+
+function inspectToolActivityCalls(
+	event: TrueForgeApi.TurnStreamingEvent,
+	calls: Map<string, MultiFileToolName>,
+	deltaCalls: Map<string, PendingActivityToolCall>,
+	reported: Set<string>,
+	progress: MultiFileAgentProgress,
+): void {
+	if (event.type === 'model.message') {
+		for (const toolCall of event.toolCalls ?? []) {
+			const toolInfo = toolCall.toolInfo?.type === 'mcp' ? toolCall.toolInfo : undefined;
+			recordToolActivityCall(
+				event.threadId,
+				toolCall.id,
+				toolInfo?.name,
+				toolInfo?.serverName,
+				calls,
+				reported,
+				progress,
+			);
+		}
+		return;
+	}
+	if (event.type !== 'model.message.delta') {
+		return;
+	}
+	for (const toolCall of event.toolCalls ?? []) {
+		const deltaKey = `${event.threadId}\0${event.id}\0${toolCall.index}`;
+		const pending = deltaCalls.get(deltaKey) ?? {};
+		pending.id = toolCall.id ?? pending.id;
+		if (toolCall.toolInfo?.type === 'mcp') {
+			pending.serverName = toolCall.toolInfo.serverName;
+			pending.toolName = toolCall.toolInfo.name;
+		}
+		deltaCalls.set(deltaKey, pending);
+		recordToolActivityCall(
+			event.threadId,
+			pending.id,
+			pending.toolName,
+			pending.serverName,
+			calls,
+			reported,
+			progress,
+		);
+	}
+}
+
+function reportApprovalToolActivity(
+	event: TrueForgeApi.ToolApprovalRequiredEvent,
+	calls: Map<string, MultiFileToolName>,
+	reported: Set<string>,
+	progress: MultiFileAgentProgress,
+): void {
+	for (const toolCall of event.toolCalls) {
+		const callKey = toolActivityKey(event.threadId, toolCall.id);
+		const toolName = calls.get(callKey);
+		if (toolName === proposeWriteToolName) {
+			reportToolActivity(toolName, 'awaiting-approval', callKey, reported, progress);
+		}
+	}
+}
+
+function reportCompletedToolActivity(
+	event: TrueForgeApi.ToolResponseEvent,
+	calls: Map<string, MultiFileToolName>,
+	reported: Set<string>,
+	progress: MultiFileAgentProgress,
+): void {
+	const callKey = toolActivityKey(event.threadId, event.toolCallId);
+	const toolName = calls.get(callKey);
+	if (toolName) {
+		reportToolActivity(toolName, 'completed', callKey, reported, progress);
+	}
 }
 
 function recordProposalToolCalls(
@@ -108,7 +245,7 @@ function recordProposalToolCalls(
 		return;
 	}
 	for (const toolCall of event.toolCalls ?? []) {
-		const toolInfo = toolCall.toolInfo.type === 'mcp' ? toolCall.toolInfo : undefined;
+		const toolInfo = toolCall.toolInfo?.type === 'mcp' ? toolCall.toolInfo : undefined;
 		if (toolInfo?.serverName !== agniWorkspaceConnectorName
 			|| toolInfo.name !== proposeWriteToolName) {
 			continue;
@@ -237,7 +374,7 @@ function resolveProposalApproval(
 			`TrueForge requested approval for unknown tool call ${pending.toolCallId}.`,
 		);
 	}
-	const toolInfo = toolCall.toolInfo.type === 'mcp' ? toolCall.toolInfo : undefined;
+	const toolInfo = toolCall.toolInfo?.type === 'mcp' ? toolCall.toolInfo : undefined;
 	if (toolInfo?.serverName !== agniWorkspaceConnectorName
 		|| toolInfo.name !== proposeWriteToolName) {
 		throw new MultiFileProposalError(
@@ -292,6 +429,7 @@ export async function runMultiFileAgentTurn(
 		}
 		const context = await contextAssembler.assemble(task, contextBudgetBytes);
 		progress.onContextAssembled?.(context.byteLength);
+		progress.onContextDetails?.(context);
 		if (cancellationToken.isCancellationRequested) {
 			throw new MultiFileEditCancelledError();
 		}
@@ -300,14 +438,20 @@ export async function runMultiFileAgentTurn(
 			agent: { spec: createMultiFileAgentSpec(modelName) },
 		});
 		let cancellationRequest: Promise<void> | undefined;
-		let pausedForApproval = false;
-		let turnActive = false;
 		const requestCancellation = (): Promise<void> => {
 			cancellationRequest ??= client.sessions.cancel(session.id)
 				.then(() => undefined)
 				.catch((error: unknown) => onCancellationError(error));
 			return cancellationRequest;
 		};
+		try {
+			progress.onSessionCreated?.(session.id);
+		} catch (error: unknown) {
+			await requestCancellation();
+			throw error;
+		}
+		let pausedForApproval = false;
+		let turnActive = false;
 		if (cancellationToken.isCancellationRequested) {
 			await requestCancellation();
 			throw new MultiFileEditCancelledError();
@@ -339,6 +483,9 @@ export async function runMultiFileAgentTurn(
 			const executedProposalCalls = new Set<string>();
 			const proposalCalls = new Map<string, ProposalToolCallIdentity>();
 			const respondedApprovals = new Set<string>();
+			const reportedToolActivity = new Set<string>();
+			const toolActivityCalls = new Map<string, MultiFileToolName>();
+			const toolActivityDeltaCalls = new Map<string, PendingActivityToolCall>();
 			const verifiedProposals = new Map<string, VerifiedProposalExecution>();
 			let request: TrueForgeApi.CreateTurnSessionsStreamRequest = {
 				input: buildWorkspaceTurnInput(task, context.content),
@@ -371,6 +518,13 @@ export async function runMultiFileAgentTurn(
 						events.set(event.id, event);
 					}
 					recordProposalToolCalls(effectiveEvent, session.id, proposalCalls);
+					inspectToolActivityCalls(
+						effectiveEvent,
+						toolActivityCalls,
+						toolActivityDeltaCalls,
+						reportedToolActivity,
+						progress,
+					);
 					if (event.type === 'turn.created') {
 						currentTurnId = event.turnId;
 					}
@@ -380,8 +534,20 @@ export async function runMultiFileAgentTurn(
 					}
 					if (event.type === 'tool.approval_required') {
 						collectApprovalEvent(event, pendingApprovals);
+						reportApprovalToolActivity(
+							event,
+							toolActivityCalls,
+							reportedToolActivity,
+							progress,
+						);
 					}
 					if (event.type === 'tool.response') {
+						reportCompletedToolActivity(
+							event,
+							toolActivityCalls,
+							reportedToolActivity,
+							progress,
+						);
 						const key = proposalExecutionKey(session.id, event.threadId, event.toolCallId);
 						const proposalCall = proposalCalls.get(key);
 						if (proposalCall) {
@@ -413,6 +579,12 @@ export async function runMultiFileAgentTurn(
 							for (const action of event.state.requiredActions) {
 								if (action.type === 'tool.approval_required') {
 									collectApprovalEvent(action, pendingApprovals);
+									reportApprovalToolActivity(
+										action,
+										toolActivityCalls,
+										reportedToolActivity,
+										progress,
+									);
 								}
 							}
 						}

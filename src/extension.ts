@@ -53,6 +53,14 @@ import {
 	MultiFileReviewTreeProvider,
 	multiFileReviewViewId,
 } from './multiFileEdit/multiFileReviewTree.js';
+import {
+	agniAgentPanelViewId,
+	AgniAgentPanelProvider,
+	buildAgentPanelContextEvidence,
+	type AgentPanelProposalState,
+	type AgentPanelRunEvents,
+	type AgentPanelTaskResult,
+} from './agentPanel/agniAgentPanel.js';
 
 const commandId = 'agni.testTrueForgeConnection';
 const workspaceToolsCommandId = 'agni.testWorkspaceTools';
@@ -136,6 +144,7 @@ async function showFailure(
 async function selectModel(
 	client: TrueForge,
 	configuredModel: string,
+	cancellationToken?: vscode.CancellationToken,
 ): Promise<ModelQuickPickItem | undefined> {
 	const { data: models } = await client.models.list();
 	if (models.length === 0) {
@@ -156,7 +165,7 @@ async function selectModel(
 			: 'Select a configured model FQN',
 		matchOnDescription: true,
 		matchOnDetail: true,
-	});
+	}, cancellationToken);
 }
 
 async function runConnectionTest(outputChannel: vscode.OutputChannel): Promise<void> {
@@ -405,6 +414,31 @@ async function updateMultiFileContexts(hasProposal: boolean, canUndo: boolean, c
 	]);
 }
 
+function getAgentPanelProposalState(
+	controller: MultiFileEditController,
+	proposalId: string | undefined,
+): AgentPanelProposalState {
+	const canUndo = controller.store.getLastApplied() !== undefined;
+	if (!proposalId || controller.store.get(proposalId)?.status !== 'review') {
+		return {
+			canApply: false,
+			canOpenReview: false,
+			canReject: false,
+			canUndo,
+			hasPendingProposal: false,
+		};
+	}
+	const review = controller.reviewState(proposalId);
+	return {
+		canApply: review.pending === 0,
+		canOpenReview: true,
+		canReject: true,
+		canUndo,
+		hasPendingProposal: true,
+		transactionId: proposalId,
+	};
+}
+
 async function refreshMultiFileReview(
 	controller: MultiFileEditController,
 	diffProvider: MultiFileDiffProvider,
@@ -526,6 +560,113 @@ async function requestProposeWriteApproval(
 			: 'The user dismissed the file-change proposal approval request.',
 		status: 'deny',
 	};
+}
+
+async function runAgentPanelTask(
+	task: string,
+	cancellationToken: vscode.CancellationToken,
+	events: AgentPanelRunEvents,
+	outputChannel: vscode.OutputChannel,
+	mcpHost: AgniMcpHttpHost,
+	controller: MultiFileEditController,
+	treeProvider: MultiFileReviewTreeProvider,
+	setActiveProposal: (id: string | undefined) => void,
+): Promise<AgentPanelTaskResult | undefined> {
+	if (!vscode.workspace.isTrusted) {
+		throw new MultiFileProposalError('Agni Agent requires a trusted VS Code workspace.');
+	}
+	if (!vscode.workspace.workspaceFolders?.length) {
+		throw new MultiFileProposalError('Open a workspace folder before running Agni Agent.');
+	}
+
+	const configuration = vscode.workspace.getConfiguration(configurationSection);
+	const serverUrl = configuration.get<string>('serverUrl', defaultServerUrl).trim() || defaultServerUrl;
+	const configuredModel = configuration.get<string>('selectedModel', '').trim();
+	const contextBudgetBytes = vscode.workspace
+		.getConfiguration('agni.context')
+		.get<number>('maxBytes', defaultContextBudgetBytes);
+	const client = new TrueForge({ baseUrl: serverUrl, timeoutInSeconds: 600 });
+	events.status(`Connecting to TrueForge at ${serverUrl}…`);
+	const selectedModel = await selectModel(client, configuredModel, cancellationToken);
+	if (!selectedModel || cancellationToken.isCancellationRequested) {
+		return undefined;
+	}
+	events.session({ model: selectedModel.modelFqn, serverUrl });
+	events.status('Starting and registering the authenticated workspace MCP connector…');
+	await startAndRegisterWorkspaceConnector(client, mcpHost);
+	await verifyMultiFileConnectorTools(client);
+
+	const transaction = controller.store.begin(task);
+	outputChannel.show(true);
+	outputChannel.appendLine('Agni Agent Panel task');
+	outputChannel.appendLine(`Model: ${selectedModel.modelFqn}`);
+	outputChannel.appendLine(`Task: ${task}`);
+	try {
+		const result = await runMultiFileAgentTurn(
+			client,
+			selectedModel.modelFqn,
+			task,
+			transaction.id,
+			controller.store,
+			cancellationToken,
+			{
+				onContextAssembled: (bytes) => outputChannel.appendLine(`[Context: ${bytes} bytes]`),
+				onContextDetails: (context) => events.context(buildAgentPanelContextEvidence(context)),
+				onSessionCreated: (sessionId) => {
+					events.session({ model: selectedModel.modelFqn, serverUrl, sessionId });
+					outputChannel.appendLine(`Session: ${sessionId}`);
+				},
+				onText: (content) => {
+					events.appendText(content);
+					outputChannel.append(content);
+				},
+				onToolActivity: (activity) => {
+					events.toolActivity(activity);
+					outputChannel.appendLine(`[Tool ${activity.toolName}: ${activity.status}]`);
+				},
+				onToolApprovalRequired: async (request) => {
+					events.status(`Waiting for approval to execute ${request.toolName}…`);
+					const decision = await requestProposeWriteApproval(request, outputChannel, cancellationToken);
+					events.status(decision.status === 'allow'
+						? `${request.toolName} approved; continuing the TrueForge turn…`
+						: `${request.toolName} denied; continuing without that proposal…`);
+					return decision;
+				},
+				onTurnDone: (status) => {
+					events.status(`TrueForge turn status: ${status}`);
+					outputChannel.appendLine(`\nTurn status: ${status}`);
+				},
+			},
+			undefined,
+			contextBudgetBytes,
+			(error) => {
+				const details = describeError(error);
+				outputChannel.appendLine(`[Error] Failed to cancel TrueForge Agent Panel session: ${details}`);
+				console.error(`[Agni] Failed to cancel TrueForge Agent Panel session: ${details}`);
+			},
+		);
+
+		await controller.openReview(result.transaction.id);
+		setActiveProposal(result.transaction.id);
+		treeProvider.setTransaction(result.transaction.id);
+		await updateMultiFileContexts(true, controller.store.getLastApplied() !== undefined);
+		return {
+			proposalCount: result.transaction.changes.size,
+			transactionId: result.transaction.id,
+			turnStatus: result.turnStatus,
+		};
+	} catch (error: unknown) {
+		const current = controller.store.get(transaction.id);
+		if (current?.status === 'generating') {
+			controller.store.cancel(transaction.id);
+		} else if (current?.status === 'review') {
+			controller.store.reject(transaction.id);
+			setActiveProposal(undefined);
+			treeProvider.setTransaction(undefined);
+			await updateMultiFileContexts(false, controller.store.getLastApplied() !== undefined);
+		}
+		throw error;
+	}
 }
 
 async function runMultiFileEdit(
@@ -848,8 +989,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		multiFileStore,
 	);
 	let activeMultiFileProposalId: string | undefined;
+	let agentPanelProvider: AgniAgentPanelProvider | undefined;
+	const syncAgentPanelProposalState = (): void => {
+		agentPanelProvider?.updateProposalState(getAgentPanelProposalState(
+			multiFileController,
+			activeMultiFileProposalId,
+		));
+	};
 	const setActiveMultiFileProposal = (id: string | undefined): void => {
 		activeMultiFileProposalId = id;
+		syncAgentPanelProposalState();
 	};
 	const inlineEditStore = new InlineEditProposalStore();
 	const inlineEditDecorationManager = new InlineEditDecorationManager();
@@ -870,6 +1019,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		console.error(`[Agni] MCP server error: ${details}`);
 	}, multiFileStore);
 	activeMcpHost = mcpHost;
+	agentPanelProvider = new AgniAgentPanelProvider(
+		(task, cancellationToken, events) => runAgentPanelTask(
+			task,
+			cancellationToken,
+			events,
+			outputChannel,
+			mcpHost,
+			multiFileController,
+			multiFileReviewTreeProvider,
+			setActiveMultiFileProposal,
+		),
+		{
+			applyReviewed: async () => {
+				await vscode.commands.executeCommand(applyReviewedMultiFileEditCommandId);
+			},
+			openReview: async () => {
+				await vscode.commands.executeCommand('workbench.view.explorer');
+				await vscode.commands.executeCommand(`${multiFileReviewViewId}.focus`);
+			},
+			rejectReviewed: async () => {
+				await vscode.commands.executeCommand(rejectMultiFileEditCommandId);
+			},
+			undo: async () => {
+				await vscode.commands.executeCommand(undoMultiFileEditCommandId);
+			},
+		},
+	);
+	const createdAgentPanelProvider = agentPanelProvider;
+	const agentPanelProposalSubscription = multiFileStore.onDidChange(() => {
+		syncAgentPanelProposalState();
+	});
+	syncAgentPanelProposalState();
+	const agentPanelView = vscode.window.registerWebviewViewProvider(
+		agniAgentPanelViewId,
+		createdAgentPanelProvider,
+		{ webviewOptions: { retainContextWhenHidden: true } },
+	);
 	const command = vscode.commands.registerCommand(commandId, async () => {
 		try {
 			await runConnectionTest(outputChannel);
@@ -1087,6 +1273,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(
 		outputChannel,
 		mcpHost,
+		createdAgentPanelProvider,
+		agentPanelProposalSubscription,
+		agentPanelView,
 		multiFileStore,
 		multiFileReviewTreeProvider,
 		multiFileReviewTree,
