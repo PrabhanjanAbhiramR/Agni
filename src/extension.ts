@@ -61,6 +61,12 @@ import {
 	type AgentPanelRunEvents,
 	type AgentPanelTaskResult,
 } from './agentPanel/agniAgentPanel.js';
+import { generateAgniPlan } from './planning/planningAgent.js';
+import { presentPlanForApproval } from './planning/planningPresenter.js';
+import { createApprovedPlanScope, formatApprovedPlanForImplementation } from './planning/planningScope.js';
+import { PlanningStore } from './planning/planningStore.js';
+import { readGitStatuses } from './git/gitStatusReader.js';
+import { presentGitStatuses } from './git/gitStatusPresenter.js';
 
 const commandId = 'agni.testTrueForgeConnection';
 const workspaceToolsCommandId = 'agni.testWorkspaceTools';
@@ -76,6 +82,7 @@ const applyReviewedMultiFileEditCommandId = 'agni.multiFileEdit.applyReviewed';
 const acceptMultiFileCommandId = 'agni.multiFileEdit.acceptFile';
 const rejectMultiFileCommandId = 'agni.multiFileEdit.rejectFile';
 const openMultiFileReviewCommandId = 'agni.multiFileEdit.openReviewFile';
+const gitStatusCommandId = 'agni.gitStatus';
 const configurationSection = 'agni.trueForge';
 const defaultServerUrl = 'http://localhost:8790';
 const testPrompt = 'Reply with one short sentence confirming that the TrueForge connection works.';
@@ -676,6 +683,7 @@ async function runMultiFileEdit(
 	diffProvider: MultiFileDiffProvider,
 	treeProvider: MultiFileReviewTreeProvider,
 	setActiveProposal: (id: string | undefined) => void,
+	planningStore: PlanningStore,
 ): Promise<void> {
 	if (!vscode.workspace.isTrusted) {
 		await vscode.window.showErrorMessage('Agni multi-file editing requires a trusted VS Code workspace.');
@@ -689,7 +697,7 @@ async function runMultiFileEdit(
 	const task = await vscode.window.showInputBox({
 		ignoreFocusOut: true,
 		placeHolder: 'Describe the multi-file change Agni should prepare',
-		prompt: 'Agni will explore the workspace and prepare proposals. Nothing is written until you accept the reviewed batch.',
+		prompt: 'Agni will create a read-only plan for approval before preparing any file proposals.',
 		title: 'Agni: Multi-File Edit',
 		validateInput: (value) => value.trim() ? undefined : 'Enter a multi-file editing task.',
 	});
@@ -719,13 +727,75 @@ async function runMultiFileEdit(
 	}
 
 	outputChannel.show(true);
-	outputChannel.appendLine('Agni: Multi-file edit');
+	outputChannel.appendLine('Agni: Multi-file edit planning');
 	outputChannel.appendLine(`Model: ${selectedModel.modelFqn}`);
-	outputChannel.appendLine('Starting authenticated proposal-only MCP tools...');
+	outputChannel.appendLine(`Task: ${task}`);
+	outputChannel.appendLine('Starting authenticated workspace tools for read-only planning...');
 	await startAndRegisterWorkspaceConnector(client, mcpHost);
 	await verifyMultiFileConnectorTools(client);
 
-	const transaction = controller.store.begin(task);
+	planningStore.startPlanning(task);
+	let plan;
+	try {
+		plan = await vscode.window.withProgress({
+			cancellable: true,
+			location: vscode.ProgressLocation.Notification,
+			title: 'Agni is inspecting the workspace and creating a plan…',
+		}, async (progress, cancellationToken) => generateAgniPlan(
+			client,
+			selectedModel.modelFqn,
+			task,
+			cancellationToken,
+			contextBudgetBytes,
+			{
+				onContextAssembled: (_references, bytes) => {
+					outputChannel.appendLine(`[Planning context: ${bytes} bytes]`);
+					progress.report({ message: `Context assembled (${bytes} bytes)…` });
+				},
+				onMcpInitialized: () => outputChannel.appendLine('[Planning] Workspace MCP connector initialized.'),
+				onCancellationError: (error) => {
+					const details = describeError(error);
+					outputChannel.appendLine(`[Error] Failed to cancel TrueForge planning session: ${details}`);
+					console.error(`[Agni] Failed to cancel TrueForge planning session: ${details}`);
+				},
+				onPlanText: (content) => outputChannel.append(content),
+				onToolCall: (name) => progress.report({ message: `Inspecting workspace with ${name}…` }),
+				onTurnDone: (status) => outputChannel.appendLine(`\nPlanning turn status: ${status}`),
+			},
+		));
+	} catch (error: unknown) {
+		if (error instanceof Error && /cancelled/iu.test(error.message)) {
+			planningStore.cancel();
+			outputChannel.appendLine('Planning cancelled. No proposal transaction was created.');
+			return;
+		}
+		planningStore.setError(describeError(error));
+		throw error;
+	}
+
+	let approvedScope;
+	try {
+		approvedScope = createApprovedPlanScope(plan);
+	} catch (error: unknown) {
+		planningStore.setError(describeError(error));
+		throw error;
+	}
+	planningStore.setPlan(plan);
+	const decision = await presentPlanForApproval(plan, outputChannel);
+	if (decision !== 'approve') {
+		if (decision === 'reject') {
+			planningStore.reject();
+			await vscode.window.showInformationMessage('Agni plan rejected. No workspace files were changed.');
+		} else {
+			planningStore.cancel();
+		}
+		return;
+	}
+	planningStore.approve();
+	const implementationTask = formatApprovedPlanForImplementation(plan, approvedScope);
+	outputChannel.appendLine('[Planning] Plan approved. Starting proposal-only implementation.');
+
+	const transaction = controller.store.begin(task, undefined, approvedScope.files);
 	try {
 		const result = await vscode.window.withProgress({
 			cancellable: true,
@@ -734,7 +804,7 @@ async function runMultiFileEdit(
 		}, async (_progress, cancellationToken) => runMultiFileAgentTurn(
 			client,
 			selectedModel.modelFqn,
-			task,
+			implementationTask,
 			transaction.id,
 			controller.store,
 			cancellationToken,
@@ -755,6 +825,7 @@ async function runMultiFileEdit(
 				outputChannel.appendLine(`[Error] Failed to cancel TrueForge multi-file session: ${details}`);
 				console.error(`[Agni] Failed to cancel TrueForge multi-file session: ${details}`);
 			},
+			approvedScope.files,
 		));
 
 		await controller.openReview(result.transaction.id);
@@ -795,6 +866,25 @@ async function runMultiFileEdit(
 		}
 		throw error;
 	}
+}
+
+async function runGitStatus(outputChannel: vscode.OutputChannel): Promise<void> {
+	if (!vscode.workspace.isTrusted) {
+		await vscode.window.showErrorMessage('Agni Git inspection requires a trusted VS Code workspace.');
+		return;
+	}
+	const folders = vscode.workspace.workspaceFolders;
+	if (!folders?.length) {
+		await vscode.window.showErrorMessage('Open a workspace folder before inspecting Git status.');
+		return;
+	}
+	const targets = folders.map((folder) => ({ name: folder.name, path: folder.uri.fsPath }));
+	const statuses = await vscode.window.withProgress({
+		cancellable: false,
+		location: vscode.ProgressLocation.Notification,
+		title: `Agni is inspecting Git status for ${targets.length} workspace folder(s)…`,
+	}, async () => readGitStatuses(targets));
+	await presentGitStatuses(statuses, outputChannel);
 }
 
 async function acceptInlineEditProposal(
@@ -973,6 +1063,7 @@ async function registerWorkspaceConnectorForCurrentExtensionHost(
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	const outputChannel = vscode.window.createOutputChannel('Agni');
+	const planningStore = new PlanningStore();
 	const multiFileStore = new MultiFileProposalStore();
 	const multiFileDiffProvider = new MultiFileDiffProvider(multiFileStore);
 	registerMultiFileDiffProvider(context, multiFileDiffProvider);
@@ -1122,9 +1213,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				multiFileDiffProvider,
 				multiFileReviewTreeProvider,
 				setActiveMultiFileProposal,
+				planningStore,
 			);
 		} catch (error: unknown) {
 			await showFailure(outputChannel, 'Agni multi-file edit failed', error);
+		}
+	});
+	const gitStatusCommand = vscode.commands.registerCommand(gitStatusCommandId, async () => {
+		try {
+			await runGitStatus(outputChannel);
+		} catch (error: unknown) {
+			await showFailure(outputChannel, 'Agni Git status inspection failed', error);
 		}
 	});
 	const acceptMultiFileEditCommand = vscode.commands.registerCommand(acceptMultiFileEditCommandId, async () => {
@@ -1271,6 +1370,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 
 	context.subscriptions.push(
+		planningStore,
+		gitStatusCommand,
 		outputChannel,
 		mcpHost,
 		createdAgentPanelProvider,

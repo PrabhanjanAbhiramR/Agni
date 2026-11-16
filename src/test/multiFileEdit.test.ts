@@ -18,6 +18,7 @@ import {
 	contentHash,
 	type MultiFileChange,
 	multiFileChangeKey,
+	MultiFilePlanScopeError,
 	MultiFileProposalStore,
 	MultiFileStaleError,
 	type MultiFileTransaction,
@@ -32,6 +33,7 @@ import { WorkspaceBoundary } from '../workspace/workspaceBoundary.js';
 
 class ProposalWorkspaceAdapter implements WorkspaceAdapter {
 	readonly files = new Map<string, string>();
+	readCount = 0;
 	readonly root: vscode.WorkspaceFolder = {
 		index: 0,
 		name: 'project',
@@ -55,6 +57,7 @@ class ProposalWorkspaceAdapter implements WorkspaceAdapter {
 	}
 
 	readFile(uri: vscode.Uri): Thenable<Uint8Array> {
+		this.readCount += 1;
 		const content = this.files.get(uri.toString());
 		return content === undefined
 			? Promise.reject(vscode.FileSystemError.FileNotFound(uri))
@@ -150,6 +153,17 @@ class EolNormalizingWorkspace extends MemoryMultiFileWorkspace {
 	}
 }
 
+class PartiallyFailingWorkspace extends MemoryMultiFileWorkspace {
+	override applyProposal(changes: readonly AppliedMultiFileChange[]): Promise<boolean> {
+		this.applyCount += 1;
+		const first = changes[0];
+		if (first) {
+			this.files.set(first.snapshot.uri.toString(), first.appliedContent);
+		}
+		return Promise.resolve(false);
+	}
+}
+
 class RecordingMultiFileDiffViewer implements MultiFileDiffViewer {
 	transactions: MultiFileTransaction[] = [];
 
@@ -240,6 +254,27 @@ suite('Autonomous multi-file editing', () => {
 		assert.strictEqual(late.isError, true);
 	});
 
+	test('rejects an out-of-plan propose_write before reading the target file', async () => {
+		const adapter = new ProposalWorkspaceAdapter();
+		adapter.add('src/outside.ts', 'sensitive workspace text');
+		const store = new MultiFileProposalStore();
+		store.begin(
+			'Scoped proposal.',
+			'pre-read-scope',
+			[{ path: 'src/approved.ts', root: 'project' }],
+		);
+		const tool = new ProposeWriteTool(store, new WorkspaceBoundary(adapter));
+
+		const result = await tool.run({ content: 'replacement', path: 'src/outside.ts', root: 'project' });
+
+		assert.strictEqual(result.isError, true);
+		assert.strictEqual(adapter.readCount, 0);
+		assert.deepStrictEqual(
+			store.require('pre-read-scope').scopeViolation,
+			{ path: 'src/outside.ts', root: 'project' },
+		);
+	});
+
 	test('reviews and atomically applies a three-file task, then rolls it back', async () => {
 		const fixture = threeFileFixture();
 		await fixture.controller.openReview(fixture.transaction.id);
@@ -261,6 +296,51 @@ suite('Autonomous multi-file editing', () => {
 		}
 	});
 
+	test('accepts two unchanged files whose current text differs only by EOL representation', async () => {
+		const store = new MultiFileProposalStore();
+		const transaction = store.begin('Update two EOL-normalized files.', 'two-eol-files');
+		addChange(store, 'src/one.py', 'first\r\nsecond\n', 'first updated\nsecond\n');
+		addChange(store, 'src/two.py', 'alpha\nbeta\n', 'alpha updated\nbeta\n');
+		store.closeForReview(transaction.id);
+		const changes = [...transaction.changes.values()];
+		const workspace = new MemoryMultiFileWorkspace(changes);
+		workspace.files.set(changes[0].snapshot.uri.toString(), 'first\nsecond\n');
+		workspace.files.set(changes[1].snapshot.uri.toString(), 'alpha\r\nbeta\r\n');
+		const controller = new MultiFileEditController(
+			workspace,
+			new RecordingMultiFileDiffViewer(),
+			store,
+		);
+
+		const applied = await controller.accept(transaction.id);
+
+		assert.strictEqual(applied.status, 'applied');
+		assert.strictEqual(workspace.applyCount, 1);
+		assert.strictEqual(workspace.files.get(changes[0].snapshot.uri.toString()), changes[0].proposedContent);
+		assert.strictEqual(workspace.files.get(changes[1].snapshot.uri.toString()), changes[1].proposedContent);
+	});
+
+	test('normalizes Windows proposal paths without changing snapshot identity', async () => {
+		const adapter = new ProposalWorkspaceAdapter();
+		adapter.add('pkg/greetings.py', 'def greet():\r\n    return "hello"\r\n');
+		const store = new MultiFileProposalStore();
+		const transaction = store.begin('Update a Windows path.', 'windows-path');
+		const tool = new ProposeWriteTool(store, new WorkspaceBoundary(adapter));
+		const result = await tool.run({
+			content: 'def greet():\n    return "hello, Agni"\n',
+			path: 'pkg\\greetings.py',
+			root: 'project',
+		});
+		assert.strictEqual(result.isError, undefined);
+		store.closeForReview(transaction.id);
+		const change = [...transaction.changes.values()][0];
+		assert.strictEqual(change.snapshot.path, 'pkg/greetings.py');
+		assert.strictEqual(
+			change.snapshot.uri.toString(),
+			vscode.Uri.joinPath(adapter.root.uri, 'pkg', 'greetings.py').toString(),
+		);
+	});
+
 	test('rejects a reviewed batch without applying it', () => {
 		const fixture = threeFileFixture();
 		const rejected = fixture.controller.reject(fixture.transaction.id);
@@ -278,6 +358,84 @@ suite('Autonomous multi-file editing', () => {
 		);
 		assert.strictEqual(fixture.transaction.status, 'stale');
 		assert.strictEqual(fixture.workspace.applyCount, 0);
+	});
+
+	test('rejects genuine content changes even when line endings also change', async () => {
+		const store = new MultiFileProposalStore();
+		const transaction = store.begin('Reject a genuinely stale file.', 'genuine-stale');
+		addChange(store, 'src/greetings.py', 'first\r\nsecond\n', 'first updated\nsecond\n');
+		store.closeForReview(transaction.id);
+		const change = [...transaction.changes.values()][0];
+		const workspace = new MemoryMultiFileWorkspace([change]);
+		workspace.files.set(change.snapshot.uri.toString(), 'first\nchanged externally\n');
+		const controller = new MultiFileEditController(
+			workspace,
+			new RecordingMultiFileDiffViewer(),
+			store,
+		);
+
+		await assert.rejects(
+			controller.accept(transaction.id),
+			(error: unknown) => error instanceof MultiFileStaleError,
+		);
+		assert.strictEqual(transaction.status, 'stale');
+		assert.strictEqual(workspace.applyCount, 0);
+	});
+
+	test('revalidates approved plan scope immediately before applying edits', async () => {
+		const store = new MultiFileProposalStore();
+		const transaction = store.begin(
+			'Apply only the approved file.',
+			'apply-scope-check',
+			[{ path: 'src/approved.ts', root: 'project' }],
+		);
+		addChange(store, 'src/approved.ts', 'old\n', 'new\n');
+		store.closeForReview(transaction.id);
+		const change = [...transaction.changes.values()][0];
+		const workspace = new MemoryMultiFileWorkspace([change]);
+		change.snapshot.path = 'src/outside.ts';
+		const controller = new MultiFileEditController(
+			workspace,
+			new RecordingMultiFileDiffViewer(),
+			store,
+		);
+
+		await assert.rejects(
+			controller.accept(transaction.id),
+			(error: unknown) => error instanceof MultiFilePlanScopeError,
+		);
+		assert.strictEqual(workspace.applyCount, 0);
+		assert.strictEqual(transaction.status, 'review');
+	});
+
+	test('retains exact recovery history after a partial apply failure', async () => {
+		const store = new MultiFileProposalStore();
+		const transaction = store.begin('Recover a partial two-file application.', 'partial-apply-failure');
+		addChange(store, 'src/one.py', 'one\n', 'one updated\n');
+		addChange(store, 'src/two.py', 'two\n', 'two updated\n');
+		store.closeForReview(transaction.id);
+		const changes = [...transaction.changes.values()];
+		const workspace = new PartiallyFailingWorkspace(changes);
+		const controller = new MultiFileEditController(
+			workspace,
+			new RecordingMultiFileDiffViewer(),
+			store,
+		);
+
+		await assert.rejects(
+			controller.accept(transaction.id),
+			(error: unknown) => error instanceof MultiFileStaleError
+				&& /recovery history was retained/iu.test(error.message),
+		);
+		assert.strictEqual(transaction.status, 'applied');
+		assert.strictEqual(store.getLastAppliedBatch()?.changes.length, 1);
+		assert.strictEqual(workspace.files.get(changes[0].snapshot.uri.toString()), changes[0].proposedContent);
+		assert.strictEqual(workspace.files.get(changes[1].snapshot.uri.toString()), changes[1].snapshot.content);
+
+		const undone = await controller.undoLast();
+		assert.strictEqual(undone.status, 'undone');
+		assert.strictEqual(workspace.files.get(changes[0].snapshot.uri.toString()), changes[0].snapshot.content);
+		assert.strictEqual(workspace.files.get(changes[1].snapshot.uri.toString()), changes[1].snapshot.content);
 	});
 
 	test('blocks rollback when an applied file changed afterward', async () => {

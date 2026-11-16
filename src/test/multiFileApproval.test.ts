@@ -4,6 +4,7 @@ import * as vscode from 'vscode';
 import { ContextAssembler } from '../context/contextAssembler.js';
 import {
 	contentHash,
+	MultiFilePlanScopeError,
 	MultiFileProposalStore,
 } from '../multiFileEdit/multiFileProposal.js';
 import {
@@ -240,6 +241,61 @@ function begin(store: MultiFileProposalStore, id: string): void {
 }
 
 suite('TrueForge propose_write approval flow', () => {
+	test('stops implementation when propose_write targets a file outside the approved plan', async () => {
+		const store = new MultiFileProposalStore();
+		store.begin(
+			'Prepare a scoped change.',
+			'plan-scope',
+			[{ path: 'src/approved.ts', root: 'project' }],
+		);
+		const pending = approvalRequired('approval-scope', 'message-scope', ['call-scope']);
+		const scripted = createScriptedClient([
+			{
+				events: [
+					turnCreated('turn-scope-1'),
+					proposalMessage('message-scope', [proposalCall(
+						'call-scope',
+						'src/outside.ts',
+						'export const outside = true;\n',
+					)]),
+					pending,
+					turnDone('done-scope-1', [pending]),
+				],
+			},
+			{
+				onCreate: () => {
+					try {
+						addProposal(store, 'src/outside.ts', 'export const outside = true;\n');
+					} catch (error: unknown) {
+						assert.ok(error instanceof MultiFilePlanScopeError);
+					}
+				},
+				events: [
+					turnCreated('turn-scope-2', 'turn-scope-1'),
+					toolResponse('response-scope', 'call-scope', 'src/outside.ts'),
+				],
+			},
+		]);
+
+		await assert.rejects(runMultiFileAgentTurn(
+			scripted.client,
+			'model/fqn',
+			'Implement the approved plan.',
+			'plan-scope',
+			store,
+			new vscode.CancellationTokenSource().token,
+			{ onToolApprovalRequired: async () => ({ status: 'allow' }) },
+			assembler(),
+			undefined,
+			undefined,
+			[{ path: 'src/approved.ts', root: 'project' }],
+		), (error: unknown) => error instanceof MultiFilePlanScopeError);
+
+		assert.strictEqual(scripted.cancelCount(), 1);
+		assert.strictEqual(store.require('plan-scope').status, 'cancelled');
+		assert.strictEqual(store.require('plan-scope').changes.size, 0);
+	});
+
 	test('allows propose_write and resumes from the exact paused turn', async () => {
 		const store = new MultiFileProposalStore();
 		begin(store, 'approved');
@@ -318,6 +374,53 @@ suite('TrueForge propose_write approval flow', () => {
 		assert.doesNotMatch(JSON.stringify(toolActivity), /package\.json|approved = true|src\/approved/u);
 		assert.strictEqual(scripted.cancelCount(), 0);
 		assert.strictEqual(store.getLastAppliedBatch(), undefined);
+	});
+
+	test('correlates an approved Python proposal after delimiter normalization', async () => {
+		const store = new MultiFileProposalStore();
+		begin(store, 'python-normalized');
+		const generated = '\\"\\"\\"Module documentation.\\"\\"\\"\n\n'
+			+ 'message = "She said \\"hello\\""\n';
+		const normalized = '"""Module documentation."""\n\n'
+			+ 'message = "She said \\"hello\\""\n';
+		const pending = approvalRequired('approval-python', 'message-python', ['call-python']);
+		const scripted = createScriptedClient([
+			{
+				events: [
+					turnCreated('turn-python-1'),
+					proposalMessage('message-python', [proposalCall(
+						'call-python',
+						'src/calculations.py',
+						generated,
+					)]),
+					pending,
+					turnDone('done-python-1', [pending]),
+				],
+			},
+			{
+				onCreate: () => addProposal(store, 'src/calculations.py', normalized),
+				events: [
+					turnCreated('turn-python-2', 'turn-python-1'),
+					toolResponse('response-python', 'call-python', 'src/calculations.py'),
+					turnDone('done-python-2'),
+				],
+			},
+		]);
+
+		const result = await runMultiFileAgentTurn(
+			scripted.client,
+			'model/fqn',
+			'Prepare a reviewed Python change.',
+			'python-normalized',
+			store,
+			new vscode.CancellationTokenSource().token,
+			{ onToolApprovalRequired: async () => ({ status: 'allow' }) },
+			assembler(),
+		);
+
+		assert.strictEqual(result.transaction.status, 'review');
+		assert.strictEqual(store.require('python-normalized').changes.values().next().value?.proposedContent, normalized);
+		assert.strictEqual(scripted.cancelCount(), 0);
 	});
 
 	test('cancels the session once when the session-created callback fails', async () => {

@@ -89,9 +89,9 @@ export function createAgniMcpServer(
 					openWorldHint: false,
 					readOnlyHint: true,
 				},
-				description: 'Record a complete proposed UTF-8 file replacement for user review. This tool never writes to the workspace.',
+				description: 'Record decoded UTF-8 source text for user review. JSON transport escaping is handled by the protocol; do not pre-escape source quotes. This tool never writes to the workspace.',
 				inputSchema: z.object({
-					content: z.string().describe('Complete proposed UTF-8 content for the file.'),
+					content: z.string().describe('Complete decoded UTF-8 source text. Preserve language-level escapes, but do not add JSON transport escapes.'),
 					path: z.string().min(1).describe('Workspace-relative file path.'),
 					root: z.string().optional().describe('Workspace root id. Required when multiple workspace folders are open.'),
 				}),

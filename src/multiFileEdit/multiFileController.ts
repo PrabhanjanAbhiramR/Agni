@@ -2,9 +2,11 @@ import * as vscode from 'vscode';
 import {
 	type AppliedMultiFileChange,
 	contentHash,
+	multiFileChangeKey,
 	type MultiFileChange,
 	MultiFileProposalError,
 	MultiFileProposalStore,
+	MultiFilePlanScopeError,
 	MultiFileStaleError,
 	type MultiFileTransaction,
 } from './multiFileProposal.js';
@@ -13,6 +15,15 @@ import { WorkspaceBoundary } from '../workspace/workspaceBoundary.js';
 
 function normalizeEolForComparison(content: string): string {
 	return content.replace(/\r\n|\r/gu, '\n');
+}
+
+function matchesContent(
+	actual: { content: string; hash: string },
+	expectedContent: string,
+	expectedHash: string,
+): boolean {
+	return actual.hash === expectedHash
+		|| normalizeEolForComparison(actual.content) === normalizeEolForComparison(expectedContent);
 }
 
 export interface MultiFileWorkspace {
@@ -177,6 +188,7 @@ export class MultiFileEditController {
 		if (changes.length === 0) {
 			return this.store.reject(id);
 		}
+		this.assertApprovedScope(transaction, changes);
 		try {
 			await this.assertOriginalsCurrent(changes);
 		} catch (error: unknown) {
@@ -184,8 +196,25 @@ export class MultiFileEditController {
 			throw error;
 		}
 
-		const applied = await this.workspace.applyProposal(changes);
+		let applied: boolean;
+		try {
+			applied = await this.workspace.applyProposal(changes);
+		} catch (error: unknown) {
+			if (await this.recordPartialApplyForRecovery(id, changes)) {
+				throw new MultiFileStaleError(
+					'VS Code failed while applying Agni changes after modifying part of the batch. '
+					+ 'Exact recovery history was retained; use Undo Last Multi-File Edit.',
+				);
+			}
+			throw error;
+		}
 		if (!applied) {
+			if (await this.recordPartialApplyForRecovery(id, changes)) {
+				throw new MultiFileStaleError(
+					'VS Code reported an incomplete Agni application after modifying part of the batch. '
+					+ 'Exact recovery history was retained; use Undo Last Multi-File Edit.',
+				);
+			}
 			throw new MultiFileProposalError('VS Code did not apply the approved multi-file edit.');
 		}
 		const readBack = await this.readBackAppliedChanges(changes);
@@ -197,6 +226,21 @@ export class MultiFileEditController {
 			);
 		}
 		return appliedTransaction;
+	}
+
+	private assertApprovedScope(
+		transaction: MultiFileTransaction,
+		changes: readonly AppliedMultiFileChange[],
+	): void {
+		if (!transaction.approvedFiles) {
+			return;
+		}
+		const approved = new Set(transaction.approvedFiles.map((file) => multiFileChangeKey(file.root, file.path)));
+		for (const change of changes) {
+			if (!approved.has(multiFileChangeKey(change.snapshot.root, change.snapshot.path))) {
+				throw new MultiFilePlanScopeError(change.snapshot.root, change.snapshot.path);
+			}
+		}
 	}
 
 	reject(id: string): MultiFileTransaction {
@@ -225,7 +269,12 @@ export class MultiFileEditController {
 	private async assertOriginalsCurrent(changes: readonly AppliedMultiFileChange[]): Promise<void> {
 		for (const change of changes) {
 			const current = await this.workspace.readCurrent(change);
-			if (current.exists !== change.snapshot.exists || current.hash !== change.snapshot.hash) {
+			if (current.exists !== change.snapshot.exists
+				|| (current.exists && !matchesContent(
+					current,
+					change.snapshot.content,
+					change.snapshot.hash,
+				))) {
 				throw new MultiFileStaleError(
 					`File changed since the proposal was captured: ${change.snapshot.root}/${change.snapshot.path}.`,
 				);
@@ -236,10 +285,38 @@ export class MultiFileEditController {
 	private async assertProposalsCurrent(changes: readonly AppliedMultiFileChange[], message: string): Promise<void> {
 		for (const change of changes) {
 			const current = await this.workspace.readCurrent(change);
-			if (!current.exists || current.hash !== change.appliedHash) {
+			if (!current.exists || !matchesContent(current, change.appliedContent, change.appliedHash)) {
 				throw new MultiFileStaleError(`${message} File: ${change.snapshot.root}/${change.snapshot.path}.`);
 			}
 		}
+	}
+
+	private async recordPartialApplyForRecovery(
+		id: string,
+		changes: readonly AppliedMultiFileChange[],
+	): Promise<boolean> {
+		const committed: AppliedMultiFileChange[] = [];
+		for (const change of changes) {
+			const current = await this.workspace.readCurrent(change);
+			const changed = current.exists !== change.snapshot.exists
+				|| (current.exists && !matchesContent(
+					current,
+					change.snapshot.content,
+					change.snapshot.hash,
+				));
+			if (changed) {
+				committed.push({
+					appliedContent: current.content,
+					appliedHash: current.hash,
+					snapshot: change.snapshot,
+				});
+			}
+		}
+		if (committed.length === 0) {
+			return false;
+		}
+		this.store.markApplied(id, committed);
+		return true;
 	}
 
 	private async readBackAppliedChanges(changes: readonly AppliedMultiFileChange[]): Promise<{

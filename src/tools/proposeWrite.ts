@@ -8,6 +8,7 @@ import {
 import { WorkspaceBoundary } from '../workspace/workspaceBoundary.js';
 import { readWorkspaceText } from '../workspace/workspaceText.js';
 import { type AgniToolResult, errorToolResult } from './toolResult.js';
+import { normalizeGeneratedSourceContent } from './generatedSourceContent.js';
 
 export interface ProposeWriteInput {
 	content: string;
@@ -81,19 +82,29 @@ export class ProposeWriteTool {
 			if (typeof input.content !== 'string') {
 				throw new Error('Proposed content must be a string.');
 			}
+			const resolved = this.boundary.resolve(input.root, input.path);
+			if (!resolved.relativePath) {
+				throw new Error('A workspace-relative file path is required.');
+			}
+			this.proposals.assertActivePathAllowed(resolved.root.id, resolved.relativePath);
+			const normalized = normalizeGeneratedSourceContent(resolved.relativePath, input.content);
 			const snapshot = await captureMultiFileSnapshot(
 				this.boundary,
-				input.root,
-				input.path,
+				resolved.root.id,
+				resolved.relativePath,
 			);
-			const change = this.proposals.propose(snapshot, input.content);
+			const change = this.proposals.propose(snapshot, normalized.content);
 			return {
 				content: [{
 					type: 'text',
-					text: `Recorded proposal for ${snapshot.root}/${snapshot.path}. No workspace file was modified.`,
+					text: `Recorded proposal for ${snapshot.root}/${snapshot.path}. No workspace file was modified.`
+						+ (normalized.normalizedPythonTripleQuotes
+							? ' Normalized transport-escaped Python triple-quote delimiters.'
+							: ''),
 				}],
 				structuredContent: {
 					created: !snapshot.exists,
+					normalizedPythonTripleQuotes: normalized.normalizedPythonTripleQuotes,
 					path: snapshot.path,
 					proposedByteLength: Buffer.byteLength(change.proposedContent, 'utf8'),
 					root: snapshot.root,

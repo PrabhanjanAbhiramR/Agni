@@ -6,6 +6,7 @@ import {
 	type MultiFileHunk,
 	type MultiFileHunkDecision,
 } from './multiFileHunks.js';
+import { type ApprovedPlanFile } from '../planning/planningTypes.js';
 
 export const maxMultiFileCount = 20;
 export const maxMultiFileBytes = 256 * 1024;
@@ -56,11 +57,13 @@ export interface MultiFileProposalChangeEvent {
 export type MultiFileReviewStatus = 'pending' | 'accepted' | 'rejected' | 'partial';
 
 export interface MultiFileTransaction {
+	approvedFiles?: readonly ApprovedPlanFile[];
 	changes: Map<string, MultiFileChange>;
 	createdAt: string;
 	id: string;
 	status: MultiFileTransactionStatus;
 	task: string;
+	scopeViolation?: ApprovedPlanFile;
 }
 
 export class MultiFileProposalError extends Error {
@@ -74,6 +77,16 @@ export class MultiFileStaleError extends MultiFileProposalError {
 	constructor(message: string) {
 		super(message);
 		this.name = 'MultiFileStaleError';
+	}
+}
+
+export class MultiFilePlanScopeError extends MultiFileProposalError {
+	constructor(root: string, path: string) {
+		super(
+			`The proposed file ${root}/${path} is outside the approved plan. `
+			+ 'No proposal was recorded; generate and approve a revised plan before changing this file.',
+		);
+		this.name = 'MultiFilePlanScopeError';
 	}
 }
 
@@ -96,7 +109,11 @@ export class MultiFileProposalStore implements vscode.Disposable {
 	private readonly transactions = new Map<string, MultiFileTransaction>();
 	readonly onDidChange = this.changeEmitter.event;
 
-	begin(task: string, id: string = randomUUID()): MultiFileTransaction {
+	begin(
+		task: string,
+		id: string = randomUUID(),
+		approvedFiles?: readonly ApprovedPlanFile[],
+	): MultiFileTransaction {
 		if (!task.trim()) {
 			throw new MultiFileProposalError('A multi-file editing task is required.');
 		}
@@ -109,6 +126,9 @@ export class MultiFileProposalStore implements vscode.Disposable {
 		}
 
 		const transaction: MultiFileTransaction = {
+			approvedFiles: approvedFiles
+				? Object.freeze(approvedFiles.map((file) => Object.freeze({ ...file })))
+				: undefined,
 			changes: new Map(),
 			createdAt: new Date().toISOString(),
 			id,
@@ -148,6 +168,20 @@ export class MultiFileProposalStore implements vscode.Disposable {
 		return this.getLastApplied() ? this.lastAppliedBatch : undefined;
 	}
 
+	assertActivePathAllowed(root: string, path: string): void {
+		const transaction = this.getActive();
+		if (!transaction || transaction.status !== 'generating') {
+			throw new MultiFileProposalError('No active Agni multi-file generation transaction accepts proposals.');
+		}
+		const key = multiFileChangeKey(root, path);
+		if (transaction.approvedFiles
+			&& !transaction.approvedFiles.some((file) => multiFileChangeKey(file.root, file.path) === key)) {
+			transaction.scopeViolation = Object.freeze({ path, root });
+			this.changeEmitter.fire({ transactionId: transaction.id });
+			throw new MultiFilePlanScopeError(root, path);
+		}
+	}
+
 	propose(snapshot: MultiFileSnapshot, proposedContent: string): MultiFileChange {
 		const transaction = this.getActive();
 		if (!transaction || transaction.status !== 'generating') {
@@ -163,6 +197,7 @@ export class MultiFileProposalStore implements vscode.Disposable {
 			);
 		}
 
+		this.assertActivePathAllowed(snapshot.root, snapshot.path);
 		const key = multiFileChangeKey(snapshot.root, snapshot.path);
 		const existing = transaction.changes.get(key);
 		const stableSnapshot = existing?.snapshot ?? snapshot;

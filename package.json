@@ -37,6 +37,7 @@
     "onCommand:agni.multiFileEdit.acceptHunk",
     "onCommand:agni.multiFileEdit.rejectHunk",
     "onCommand:agni.multiFileEdit.openReviewFile",
+    "onCommand:agni.gitStatus",
     "onView:agni.agentPanel"
   ],
   "main": "./out/extension.js",
@@ -121,6 +122,10 @@
         "title": "Open File Diff",
         "enablement": "agni.hasMultiFileProposal",
         "icon": "$(diff)"
+      },
+      {
+        "command": "agni.gitStatus",
+        "title": "Agni: Show Git Status and Risk Indicators"
       }
     ],
     "views": {

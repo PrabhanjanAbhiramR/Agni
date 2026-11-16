@@ -46,4 +46,12 @@ suite('TrueForge workspace agent configuration', () => {
 		assert.ok(!spec.mcpServers?.[0]?.requireApprovalForTools?.includes('list_files'));
 		assert.ok(!spec.mcpServers?.[0]?.requireApprovalForTools?.includes('search_code'));
 	});
+
+	test('adds the approved file scope to implementation agent instructions', () => {
+		const spec = createMultiFileAgentSpec('discovered/model-fqn', [
+			{ path: 'src/allowed.ts', root: 'project' },
+		]);
+		assert.match(spec.instructions ?? '', /project\/src\/allowed\.ts/u);
+		assert.match(spec.instructions ?? '', /renewed user approval/iu);
+	});
 });

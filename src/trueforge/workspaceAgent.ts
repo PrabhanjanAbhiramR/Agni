@@ -1,4 +1,5 @@
 import { TrueForge, type TrueForgeApi } from '@truefoundry/trueforge-sdk';
+import * as vscode from 'vscode';
 import { ContextAssembler, defaultContextBudgetBytes } from '../context/contextAssembler.js';
 import { agniWorkspaceToolNames } from '../mcp/agniMcpServer.js';
 import { AgniMcpHttpHost, type AgniMcpEndpoint } from '../mcp/httpMcpHost.js';
@@ -22,8 +23,10 @@ export interface WorkspaceAgentProgress {
 }
 
 export interface WorkspaceAgentTurnOptions {
+	cancellationToken?: vscode.CancellationToken;
 	contextAssembler?: ContextAssembler;
 	contextBudgetBytes?: number;
+	onCancellationError?: (error: unknown) => void;
 }
 
 export interface WorkspaceAgentResult {
@@ -31,6 +34,13 @@ export interface WorkspaceAgentResult {
 	toolName: string;
 	toolResponse: string;
 	turnStatus: string;
+}
+
+export class WorkspaceAgentCancelledError extends Error {
+	constructor() {
+		super('TrueForge workspace turn was cancelled.');
+		this.name = 'WorkspaceAgentCancelledError';
+	}
 }
 
 interface PendingToolCall {
@@ -193,11 +203,18 @@ export async function runWorkspaceAgentTurn(
 	progress: WorkspaceAgentProgress = {},
 	options: WorkspaceAgentTurnOptions = {},
 ): Promise<WorkspaceAgentResult> {
+	const cancellationToken = options.cancellationToken;
+	if (cancellationToken?.isCancellationRequested) {
+		throw new WorkspaceAgentCancelledError();
+	}
 	const contextAssembler = options.contextAssembler ?? new ContextAssembler();
 	const assembledContext = await contextAssembler.assemble(
 		prompt,
 		options.contextBudgetBytes ?? defaultContextBudgetBytes,
 	);
+	if (cancellationToken?.isCancellationRequested) {
+		throw new WorkspaceAgentCancelledError();
+	}
 	progress.onContextAssembled?.(
 		assembledContext.references.length,
 		assembledContext.byteLength,
@@ -209,67 +226,123 @@ export async function runWorkspaceAgentTurn(
 	const { data: session } = await client.sessions.create({
 		agent: { spec: createWorkspaceAgentSpec(modelName) },
 	});
-	const stream = await client.sessions.createTurnStream(session.id, {
-		input: buildWorkspaceTurnInput(prompt, assembledContext.content),
-	});
-	const callsById = new Map<string, string>();
-	const deltaCalls = new Map<string, PendingToolCall>();
-	let answer = '';
-	let completedStatus: string | undefined;
-	let matchedToolName: string | undefined;
-	let matchedToolResponse: string | undefined;
-
-	for await (const event of stream) {
-		inspectToolCalls(event, callsById, deltaCalls, progress);
-
-		if (event.type === 'mcp.initialize'
-			&& event.mcpServers.some((server) => server.name === agniWorkspaceConnectorName)) {
-			progress.onMcpInitialized?.();
-		}
-
-		if (event.type === 'tool.response') {
-			const toolName = callsById.get(event.toolCallId);
-			if (toolName) {
-				matchedToolName = toolName;
-				matchedToolResponse = event.content;
-				progress.onToolResponse?.(toolName);
-			}
-		}
-
-		if (event.type === 'model.message.delta' && event.threadId === 'main' && event.content) {
-			answer += event.content;
-			progress.onText?.(event.content);
-		}
-
-		if (event.type === 'turn.done') {
-			completedStatus = event.state.status;
-			progress.onTurnDone?.(completedStatus);
-			if (event.state.status === 'error') {
-				throw new Error(`TrueForge workspace turn failed: ${event.state.message}`);
-			}
-			if (event.state.status === 'cancelled') {
-				throw new Error(`TrueForge workspace turn was cancelled: ${event.state.reason}`);
-			}
-		}
-	}
-
-	if (!completedStatus) {
-		throw new Error('The TrueForge workspace event stream ended without a turn.done event.');
-	}
-	if (!matchedToolName) {
-		throw new Error('TrueForge completed the turn without calling an Agni workspace tool.');
-	}
-	if (!matchedToolResponse?.trim()) {
-		throw new Error(`TrueForge called ${matchedToolName}, but no non-empty tool result was returned.`);
-	}
-	if (!answer.trim()) {
-		throw new Error('TrueForge returned the workspace tool result but produced no final model response.');
-	}
-
-	return {
-		answer,
-		toolName: matchedToolName,
-		toolResponse: matchedToolResponse,
-		turnStatus: completedStatus,
+	let cancellationRequest: Promise<void> | undefined;
+	const requestCancellation = (): Promise<void> => {
+		cancellationRequest ??= client.sessions.cancel(session.id)
+			.then(() => undefined)
+			.catch((error: unknown) => options.onCancellationError?.(error));
+		return cancellationRequest;
 	};
+	let signalCancellation: (() => void) | undefined;
+	const cancellationSignal = new Promise<{ cancelled: true }>((resolve) => {
+		signalCancellation = () => resolve({ cancelled: true });
+	});
+	const cancellation = cancellationToken?.onCancellationRequested(() => {
+		void requestCancellation();
+		signalCancellation?.();
+	});
+	const waitForOperation = async <T>(operation: Promise<T>): Promise<T> => {
+		if (!cancellationToken) {
+			return operation;
+		}
+		const result = await Promise.race([
+			operation.then((value) => ({ cancelled: false as const, value })),
+			cancellationSignal,
+		]);
+		if (result.cancelled) {
+			throw new WorkspaceAgentCancelledError();
+		}
+		return result.value;
+	};
+	let turnActive = false;
+	try {
+		if (cancellationToken?.isCancellationRequested) {
+			await requestCancellation();
+			throw new WorkspaceAgentCancelledError();
+		}
+		turnActive = true;
+		const stream = await waitForOperation(client.sessions.createTurnStream(session.id, {
+			input: buildWorkspaceTurnInput(prompt, assembledContext.content),
+		}));
+		const iterator = stream[Symbol.asyncIterator]();
+		const callsById = new Map<string, string>();
+		const deltaCalls = new Map<string, PendingToolCall>();
+		let answer = '';
+		let completedStatus: string | undefined;
+		let matchedToolName: string | undefined;
+		let matchedToolResponse: string | undefined;
+
+		while (true) {
+			const next = await waitForOperation(iterator.next());
+			if (next.done) {
+				break;
+			}
+			if (cancellationToken?.isCancellationRequested) {
+				throw new WorkspaceAgentCancelledError();
+			}
+			const event = next.value;
+			inspectToolCalls(event, callsById, deltaCalls, progress);
+
+			if (event.type === 'mcp.initialize'
+				&& event.mcpServers.some((server) => server.name === agniWorkspaceConnectorName)) {
+				progress.onMcpInitialized?.();
+			}
+
+			if (event.type === 'tool.response') {
+				const toolName = callsById.get(event.toolCallId);
+				if (toolName) {
+					matchedToolName = toolName;
+					matchedToolResponse = event.content;
+					progress.onToolResponse?.(toolName);
+				}
+			}
+
+			if (event.type === 'model.message.delta' && event.threadId === 'main' && event.content) {
+				answer += event.content;
+				progress.onText?.(event.content);
+			}
+
+			if (event.type === 'turn.done') {
+				turnActive = false;
+				completedStatus = event.state.status;
+				progress.onTurnDone?.(completedStatus);
+				if (event.state.status === 'error') {
+					throw new Error(`TrueForge workspace turn failed: ${event.state.message}`);
+				}
+				if (event.state.status === 'cancelled') {
+					throw new WorkspaceAgentCancelledError();
+				}
+			}
+		}
+
+		if (cancellationToken?.isCancellationRequested) {
+			throw new WorkspaceAgentCancelledError();
+		}
+		if (!completedStatus) {
+			throw new Error('The TrueForge workspace event stream ended without a turn.done event.');
+		}
+		if (!matchedToolName) {
+			throw new Error('TrueForge completed the turn without calling an Agni workspace tool.');
+		}
+		if (!matchedToolResponse?.trim()) {
+			throw new Error(`TrueForge called ${matchedToolName}, but no non-empty tool result was returned.`);
+		}
+		if (!answer.trim()) {
+			throw new Error('TrueForge returned the workspace tool result but produced no final model response.');
+		}
+
+		return {
+			answer,
+			toolName: matchedToolName,
+			toolResponse: matchedToolResponse,
+			turnStatus: completedStatus,
+		};
+	} catch (error: unknown) {
+		if (turnActive || cancellationToken?.isCancellationRequested) {
+			await requestCancellation();
+		}
+		throw error;
+	} finally {
+		cancellation?.dispose();
+	}
 }

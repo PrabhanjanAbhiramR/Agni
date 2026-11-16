@@ -9,6 +9,8 @@ Agni is a VS Code AI coding agent powered entirely by a local TrueForge runtime.
 - Resolve explicit `@file` and `@symbol` references and retrieve relevant workspace context.
 - Generate Inline Edit proposals and review them in VS Code's diff editor before applying.
 - Generate multi-file proposals with per-file and per-hunk review, atomic application, stale-file protection, and guarded undo.
+- Plan multi-file edits in a read-only TrueForge turn, review the structured plan, and approve its exact file scope before implementation begins.
+- Inspect staged, unstaged, deleted, and untracked Git changes across every open workspace folder without modifying Git state.
 
 Agni does not write files while TrueForge is generating a proposal. Accepted edits are applied through VS Code `WorkspaceEdit` operations.
 
@@ -83,8 +85,40 @@ modify those runtime flows.
 - `Agni: Multi-File Edit`
 - `Agni: Apply Reviewed Changes`
 - `Agni: Undo Last Multi-File Edit`
+- `Agni: Show Git Status and Risk Indicators`
 
 The **Agni Review** view in the Explorer contains file and hunk review actions for active multi-file proposals.
+
+## Planning Mode
+
+Run **Agni: Multi-File Edit** and enter the task normally. Agni first uses the
+authenticated read-only MCP tools to inspect the workspace and asks TrueForge
+for a structured plan containing an objective, ordered steps, affected files,
+dependencies, and risks. Review that plan in the **Agni** output channel and
+approve it in the modal confirmation before implementation starts.
+
+The approved plan—not only the original task—is sent to the implementation
+agent. `propose_write` is restricted to the approved workspace-root/file pairs,
+and Agni validates the same scope again before applying reviewed edits. If the
+implementation discovers that another file is required, the run stops without
+recording that out-of-scope proposal; start Multi-File Edit again to review and
+approve a revised plan. Cancelling either model-execution phase cancels its
+TrueForge session, and late stream responses cannot create proposals.
+
+In a multi-root workspace, planned paths are displayed as
+`<workspace-root-id>/<relative-path>` so approval remains unambiguous.
+
+## Git-aware status
+
+Run **Agni: Show Git Status and Risk Indicators** to inspect every open
+workspace folder. Agni uses fixed, read-only Git commands to report the branch,
+staged and unstaged files, deletions, untracked files, and available line-count
+summaries. It never stages, resets, checks out, commits, pushes, or runs a Git
+command supplied by a model.
+
+Risk indicators are deterministic filename and change-type heuristics. They
+help prioritize review, but they are explicitly not verified vulnerabilities or
+evidence that a file contains a secret.
 
 ## Settings
 

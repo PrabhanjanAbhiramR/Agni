@@ -352,4 +352,11 @@ suite('Inline edit workflow', () => {
 			(error: unknown) => error instanceof InlineEditProposalError && /invalid inline edit response/iu.test(error.message),
 		);
 	});
+
+	test('preserves Python source exactly through JSON and fenced JSON parsing', () => {
+		const source = '"""Module documentation."""\n\nmessage = "She said \\"hello\\""\n';
+		const json = JSON.stringify({ replacement: source });
+		assert.strictEqual(parseInlineEditResponse(json), source);
+		assert.strictEqual(parseInlineEditResponse('```json\n' + json + '\n```'), source);
+	});
 });
