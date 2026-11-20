@@ -42,7 +42,12 @@ class SourceProposalAdapter implements WorkspaceAdapter {
 		if (content !== undefined) {
 			return Promise.resolve({ ctime: 0, mtime: 0, size: content.length, type: vscode.FileType.File });
 		}
-		return Promise.resolve({ ctime: 0, mtime: 0, size: 0, type: vscode.FileType.Directory });
+		const prefix = `${uri.toString().replace(/\/$/u, '')}/`;
+		if (uri.toString() === this.root.uri.toString()
+			|| [...this.files.keys()].some((entry) => entry.startsWith(prefix))) {
+			return Promise.resolve({ ctime: 0, mtime: 0, size: 0, type: vscode.FileType.Directory });
+		}
+		return Promise.reject(vscode.FileSystemError.FileNotFound(uri));
 	}
 }
 
@@ -79,8 +84,6 @@ suite('Generated source content', () => {
 
 	test('records two proposals with valid Python delimiters and exact ordinary escapes', async () => {
 		const adapter = new SourceProposalAdapter();
-		adapter.add('first.py', 'old first\n');
-		adapter.add('second.py', 'old second\n');
 		const store = new MultiFileProposalStore();
 		store.begin('Update two Python modules.', 'python-multi-file', [
 			{ path: 'first.py', root: 'project' },

@@ -107,6 +107,22 @@ suite('Workspace boundary and read-only tools', () => {
 		assert.strictEqual(result.structuredContent?.fromOpenDocument, true);
 	});
 
+	test('reads an inclusive line range and renders line numbers', async () => {
+		const root = folder('project', 'C:\\agni-test\\project');
+		const adapter = new TestWorkspaceAdapter([root]);
+		adapter.addFile(vscode.Uri.joinPath(root.uri, 'src', 'range.ts'), 'first\r\nsecond\r\nthird\r\n');
+		const result = await new ReadFileTool(new WorkspaceBoundary(adapter)).run({
+			endLine: 3,
+			path: 'src/range.ts',
+			root: 'project',
+			startLine: 2,
+		});
+
+		assert.strictEqual(result.isError, undefined);
+		assert.strictEqual(result.structuredContent?.content, 'second\nthird');
+		assert.match(result.content[0]?.text ?? '', /2: second\n3: third/u);
+	});
+
 	test('limits search results', async () => {
 		const root = folder('project', 'C:\\agni-test\\project');
 		const adapter = new TestWorkspaceAdapter([root]);
@@ -122,5 +138,6 @@ suite('Workspace boundary and read-only tools', () => {
 		assert.strictEqual(result.isError, undefined);
 		assert.strictEqual((result.structuredContent?.matches as unknown[]).length, 2);
 		assert.strictEqual(result.structuredContent?.truncated, true);
+		assert.match(result.content[0]?.text ?? '', /one\.ts:1:1: needle one/u);
 	});
 });

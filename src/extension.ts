@@ -42,6 +42,7 @@ import {
 	MultiFileStaleError,
 } from './multiFileEdit/multiFileProposal.js';
 import {
+	approvalDiagnostic,
 	MultiFileEditCancelledError,
 	type MultiFileToolApprovalRequest,
 	runMultiFileAgentTurn,
@@ -541,17 +542,34 @@ async function undoLastMultiFileEdit(controller: MultiFileEditController): Promi
 	);
 }
 
-async function requestProposeWriteApproval(
+export async function requestProposeWriteApproval(
 	request: MultiFileToolApprovalRequest,
 	outputChannel: vscode.OutputChannel,
 	cancellationToken: vscode.CancellationToken,
+	showPrompt: (message: string, options: vscode.MessageOptions, ...items: string[]) => Thenable<string | undefined>
+		= vscode.window.showWarningMessage,
 ): Promise<{ status: 'allow' } | { reason: string; status: 'deny' }> {
-	const action = await vscode.window.showWarningMessage(
+	const trace = (stage: string): void => outputChannel.appendLine(approvalDiagnostic(stage, {
+		threadId: request.threadId, toolCallId: request.toolCallId,
+	}));
+	trace('extension.callback-received');
+	trace('ui.requested');
+	const notification = showPrompt(
 		`Agni wants permission to run ${request.toolName} and generate a workspace file-change proposal. `
 		+ 'This only records a proposal for per-file and per-hunk review; it does not write any file.',
+		{ modal: true },
 		'Allow Proposal',
 		'Deny',
 	);
+	trace('ui.promise-created');
+	let action: string | undefined;
+	try {
+		action = await notification;
+	} catch (error: unknown) {
+		trace('ui.failed');
+		throw error;
+	}
+	trace(action === 'Allow Proposal' ? 'ui.allow' : action === 'Deny' ? 'ui.deny' : 'ui.dismissed');
 	if (cancellationToken.isCancellationRequested) {
 		return { reason: 'Multi-file edit generation was cancelled.', status: 'deny' };
 	}
@@ -619,6 +637,7 @@ async function runAgentPanelTask(
 			{
 				onContextAssembled: (bytes) => outputChannel.appendLine(`[Context: ${bytes} bytes]`),
 				onContextDetails: (context) => events.context(buildAgentPanelContextEvidence(context)),
+				onApprovalDiagnostic: (message) => outputChannel.appendLine(message),
 				onSessionCreated: (sessionId) => {
 					events.session({ model: selectedModel.modelFqn, serverUrl, sessionId });
 					outputChannel.appendLine(`Session: ${sessionId}`);
@@ -811,6 +830,7 @@ async function runMultiFileEdit(
 			{
 				onContextAssembled: (bytes) => outputChannel.appendLine(`[Context: ${bytes} bytes]`),
 				onText: (content) => outputChannel.append(content),
+				onApprovalDiagnostic: (message) => outputChannel.appendLine(message),
 				onToolApprovalRequired: (request) => requestProposeWriteApproval(
 					request,
 					outputChannel,

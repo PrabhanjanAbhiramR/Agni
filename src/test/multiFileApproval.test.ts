@@ -1,6 +1,7 @@
 import * as assert from 'node:assert';
 import { TrueForge, type TrueForgeApi } from '@truefoundry/trueforge-sdk';
 import * as vscode from 'vscode';
+import { requestProposeWriteApproval } from '../extension.js';
 import { ContextAssembler } from '../context/contextAssembler.js';
 import {
 	contentHash,
@@ -19,6 +20,8 @@ const createdAt = '2026-11-09T00:00:00.000Z';
 interface ScriptStep {
 	events?: TrueForgeApi.TurnStreamingEvent[];
 	onCreate?: (request: TrueForgeApi.CreateTurnSessionsStreamRequest) => void;
+	persistedEvents?: TrueForgeApi.SessionEvent[];
+	returnWaitFor?: Promise<void>;
 	streamError?: Error;
 	waitFor?: Promise<void>;
 }
@@ -45,6 +48,7 @@ function turnCreated(turnId: string, previousTurnId: string | null = null): True
 function proposalMessage(
 	messageId: string,
 	toolCalls: Array<{ arguments?: string; id: string }>,
+	identity: { serverName?: string; toolName?: string } = {},
 ): TrueForgeApi.ModelMessageEvent {
 	return {
 		content: null,
@@ -58,9 +62,9 @@ function proposalMessage(
 			},
 			id: toolCall.id,
 			toolInfo: {
-				name: 'propose_write',
+				name: identity.toolName ?? 'propose_write',
 				serverId: 'mcp-server-id',
-				serverName: 'agni-vscode-workspace',
+				serverName: identity.serverName ?? 'agni-vscode-workspace',
 				type: 'mcp',
 			},
 			type: 'function',
@@ -90,18 +94,57 @@ function approvalRequired(
 function turnDone(
 	eventId: string,
 	requiredActions: TrueForgeApi.ActionRequiredEvent[] = [],
+	output: TrueForgeApi.ModelMessageEvent | null = null,
 ): TrueForgeApi.TurnDoneEvent {
 	return {
 		createdAt,
 		id: eventId,
 		state: {
 			completedAt: createdAt,
-			output: null,
+			output,
 			requiredActions,
 			status: 'done',
 		},
 		threadId: null,
 		type: 'turn.done',
+	};
+}
+
+function proposalDelta(
+	messageId: string,
+	index: number,
+	fragment: {
+		arguments?: string;
+		id?: string;
+		includeIdentity?: boolean;
+		name?: string;
+		serverName?: string;
+		toolName?: string;
+	},
+): TrueForgeApi.ModelMessageDeltaEvent {
+	return {
+		id: messageId,
+		threadId: 'main',
+		toolCalls: [{
+			function: fragment.arguments === undefined && fragment.name === undefined
+				? undefined
+				: {
+					arguments: fragment.arguments,
+					name: fragment.name,
+				},
+			id: fragment.id,
+			index,
+			toolInfo: fragment.includeIdentity === false
+				? undefined
+				: {
+					name: fragment.toolName ?? 'propose_write',
+					serverId: 'mcp-server-id',
+					serverName: fragment.serverName ?? 'agni-vscode-workspace',
+					type: 'mcp',
+				},
+			type: 'function',
+		}],
+		type: 'model.message.delta',
 	};
 }
 
@@ -181,6 +224,7 @@ function readOnlyDelta(
 
 function createScriptedClient(steps: ScriptStep[]): ScriptedClient {
 	const requests: TrueForgeApi.CreateTurnSessionsStreamRequest[] = [];
+	const persistedEventsByTurn = new Map<string, TrueForgeApi.SessionEvent[]>();
 	let cancelCount = 0;
 	let stepIndex = 0;
 	const client = {
@@ -199,9 +243,12 @@ function createScriptedClient(steps: ScriptStep[]): ScriptedClient {
 				if (!step) {
 					throw new Error('Unexpected extra TrueForge turn.');
 				}
+				const created = step.events?.find((event) => event.type === 'turn.created');
+				if (created?.type === 'turn.created') {
+					persistedEventsByTurn.set(created.turnId, step.persistedEvents ?? []);
+				}
 				step.onCreate?.(request);
-				return {
-					async *[Symbol.asyncIterator]() {
+				const generator = (async function* () {
 						for (const event of step.events ?? []) {
 							yield event;
 						}
@@ -211,9 +258,24 @@ function createScriptedClient(steps: ScriptStep[]): ScriptedClient {
 						if (step.streamError) {
 							throw step.streamError;
 						}
+				})();
+				return {
+					[Symbol.asyncIterator]() {
+						return {
+							next: () => generator.next(),
+							return: step.returnWaitFor
+								? async () => {
+									await step.returnWaitFor;
+									return { done: true as const, value: undefined };
+								}
+								: () => generator.return(undefined),
+						};
 					},
 				};
 			},
+			listTurnEvents: async (_sessionId: string, turnId: string) => ({
+				data: persistedEventsByTurn.get(turnId) ?? [],
+			}),
 		},
 	} as unknown as TrueForge;
 	return { cancelCount: () => cancelCount, client, requests };
@@ -236,11 +298,151 @@ function addProposal(store: MultiFileProposalStore, path: string, proposedConten
 	}, proposedContent);
 }
 
+function addEditedProposal(
+	store: MultiFileProposalStore,
+	path: string,
+	originalContent: string,
+	proposedContent: string,
+): void {
+	store.propose({
+		content: originalContent,
+		exists: true,
+		hash: contentHash(originalContent),
+		path,
+		root: 'project',
+		uri: vscode.Uri.file(`C:\\agni-approval-test\\project\\${path.replaceAll('/', '\\')}`),
+	}, proposedContent);
+}
+
 function begin(store: MultiFileProposalStore, id: string): void {
 	store.begin('Prepare a reviewed change.', id);
 }
 
+interface SequentialApprovalFixture {
+	callIds: string[];
+	client: ScriptedClient;
+	paths: string[];
+	turnIds: string[];
+}
+
+function createSequentialApprovalFixture(
+	store: MultiFileProposalStore,
+	prefix: string,
+	decisions: readonly TrueForgeApi.ApprovalDecision[],
+): SequentialApprovalFixture {
+	const callIds = decisions.map((_, index) => `call-${prefix}-${index + 1}`);
+	const messageIds = decisions.map((_, index) => `message-${prefix}-${index + 1}`);
+	const paths = decisions.map((_, index) => `src/${prefix}-${index + 1}.ts`);
+	const contents = decisions.map((_, index) => `export const ${prefix.replaceAll('-', '_')}_${index + 1} = true;\n`);
+	const turnIds = decisions.map((_, index) => `turn-${prefix}-${index + 1}`);
+	const messages = decisions.map((_, index) => proposalMessage(
+		messageIds[index],
+		[proposalCall(callIds[index], paths[index], contents[index])],
+	));
+	const approvals = decisions.map((_, index) => approvalRequired(
+		`approval-${prefix}-${index + 1}`,
+		messageIds[index],
+		[callIds[index]],
+	));
+	const steps: ScriptStep[] = decisions.map((_, index) => {
+		const events: TrueForgeApi.TurnStreamingEvent[] = [
+			turnCreated(turnIds[index], index === 0 ? null : turnIds[index - 1]),
+		];
+		if (index > 0 && decisions[index - 1].status === 'allow') {
+			events.push(toolResponse(
+				`response-${prefix}-${index}`,
+				callIds[index - 1],
+				paths[index - 1],
+			));
+		}
+		events.push(
+			proposalDelta(messageIds[index], 0, {
+				arguments: messages[index].toolCalls?.[0].function.arguments,
+				id: callIds[index],
+				name: 'call_tool',
+			}),
+			approvals[index],
+			turnDone(`done-${prefix}-${index + 1}`, [approvals[index]]),
+		);
+		return {
+			events,
+			onCreate: index === 0 || decisions[index - 1].status !== 'allow'
+				? undefined
+				: () => addProposal(store, paths[index - 1], contents[index - 1]),
+			persistedEvents: [messages[index]],
+		};
+	});
+	const lastIndex = decisions.length - 1;
+	const finalEvents: TrueForgeApi.TurnStreamingEvent[] = [
+		turnCreated(`turn-${prefix}-final`, turnIds[lastIndex]),
+	];
+	if (decisions[lastIndex].status === 'allow') {
+		finalEvents.push(toolResponse(
+			`response-${prefix}-final`,
+			callIds[lastIndex],
+			paths[lastIndex],
+		));
+	}
+	finalEvents.push(turnDone(`done-${prefix}-final`));
+	steps.push({
+		events: finalEvents,
+		onCreate: decisions[lastIndex].status === 'allow'
+			? () => addProposal(store, paths[lastIndex], contents[lastIndex])
+			: undefined,
+	});
+
+	return {
+		callIds,
+		client: createScriptedClient(steps),
+		paths,
+		turnIds,
+	};
+}
+
 suite('TrueForge propose_write approval flow', () => {
+	test('keeps sequential approval prompts modal and waits for an explicit user decision', async () => {
+		const logs: string[] = [];
+		const output = {
+			appendLine: (line: string): void => { logs.push(line); },
+		} as unknown as vscode.OutputChannel;
+		const cancellation = new vscode.CancellationTokenSource();
+		try {
+			for (let index = 0; index < 3; index += 1) {
+				let resolvePrompt: ((action: string | undefined) => void) | undefined;
+				let settled = false;
+				const result = requestProposeWriteApproval({
+					arguments: 'PRIVATE_ARGUMENT_SENTINEL', threadId: 'main', toolCallId: `ui-call-${index}`,
+					toolName: 'propose_write',
+				}, output, cancellation.token, (message, options, ...actions) => {
+					assert.strictEqual(options.modal, true, 'Approval must not disappear into notification history.');
+					assert.ok(message.includes('does not write any file'));
+					assert.deepStrictEqual(actions, ['Allow Proposal', 'Deny']);
+					return new Promise<string | undefined>((resolve) => { resolvePrompt = resolve; });
+				}).then((decision) => { settled = true; return decision; });
+				await Promise.resolve();
+				assert.strictEqual(settled, false);
+				resolvePrompt?.(index === 1 ? 'Deny' : 'Allow Proposal');
+				assert.strictEqual((await result).status, index === 1 ? 'deny' : 'allow');
+			}
+			assert.strictEqual(logs.filter((line) => line.includes('ui.promise-created')).length, 3);
+			assert.ok(!logs.join('\n').includes('PRIVATE_ARGUMENT_SENTINEL'));
+		} finally {
+			cancellation.dispose();
+		}
+	});
+
+	test('a cancelled modal approval cannot authorize a late Allow response', async () => {
+		const cancellation = new vscode.CancellationTokenSource();
+		try {
+			const decision = await requestProposeWriteApproval({
+				arguments: '{}', threadId: 'main', toolCallId: 'late-modal', toolName: 'propose_write',
+			}, { appendLine: () => undefined } as unknown as vscode.OutputChannel, cancellation.token,
+			async () => { cancellation.cancel(); return 'Allow Proposal'; });
+			assert.strictEqual(decision.status, 'deny');
+		} finally {
+			cancellation.dispose();
+		}
+	});
 	test('stops implementation when propose_write targets a file outside the approved plan', async () => {
 		const store = new MultiFileProposalStore();
 		store.begin(
@@ -375,6 +577,303 @@ suite('TrueForge propose_write approval flow', () => {
 		assert.strictEqual(scripted.cancelCount(), 0);
 		assert.strictEqual(store.getLastAppliedBatch(), undefined);
 	});
+
+	test('requires and verifies explicit approval for propose_edit', async () => {
+		const store = new MultiFileProposalStore();
+		begin(store, 'approved-edit');
+		const original = 'export const value = "old";\n';
+		const proposed = 'export const value = "new";\n';
+		const argumentsJson = JSON.stringify({
+			edits: [{ new_str: '"new"', old_str: '"old"' }],
+			path: 'src/existing.ts',
+		});
+		const message = proposalMessage(
+			'message-edit',
+			[{ arguments: argumentsJson, id: 'call-edit' }],
+			{ toolName: 'propose_edit' },
+		);
+		const pending = approvalRequired('approval-edit', 'message-edit', ['call-edit']);
+		const scripted = createScriptedClient([
+			{
+				events: [turnCreated('turn-edit-1'), message, pending, turnDone('done-edit-1', [pending])],
+			},
+			{
+				events: [
+					turnCreated('turn-edit-2', 'turn-edit-1'),
+					toolResponse('response-edit', 'call-edit', 'src/existing.ts'),
+					turnDone('done-edit-2'),
+				],
+				onCreate: () => addEditedProposal(store, 'src/existing.ts', original, proposed),
+			},
+		]);
+		const approvals: MultiFileToolApprovalRequest[] = [];
+
+		const result = await runMultiFileAgentTurn(
+			scripted.client,
+			'model/fqn',
+			'Edit one existing file.',
+			'approved-edit',
+			store,
+			new vscode.CancellationTokenSource().token,
+			{
+				onToolApprovalRequired: async (request) => {
+					approvals.push(request);
+					return { status: 'allow' };
+				},
+			},
+			assembler(),
+		);
+
+		assert.strictEqual(approvals.length, 1);
+		assert.strictEqual(approvals[0].toolName, 'propose_edit');
+		assert.strictEqual(approvals[0].arguments, argumentsJson);
+		assert.strictEqual(scripted.requests[1].previousTurnId, 'turn-edit-1');
+		assert.strictEqual(result.transaction.changes.size, 1);
+		assert.strictEqual(
+			result.transaction.changes.get('project\0src/existing.ts')?.proposedContent,
+			proposed,
+		);
+	});
+
+	test('correlates a delta-only proposal from the authoritative turn output', async () => {
+		const store = new MultiFileProposalStore();
+		begin(store, 'delta-only');
+		const path = 'src/delta-only.ts';
+		const content = 'export const deltaOnly = true;\n';
+		const authoritativeArguments = JSON.stringify({ content, path });
+		const splitAt = Math.floor(authoritativeArguments.length / 2);
+		const output = proposalMessage(
+			'message-delta-only',
+			[{ arguments: authoritativeArguments, id: 'call-delta-only' }],
+		);
+		const pending = approvalRequired(
+			'approval-delta-only',
+			output.id,
+			['call-delta-only'],
+		);
+		const scripted = createScriptedClient([
+			{
+				events: [
+					turnCreated('turn-delta-only-1'),
+					proposalDelta(output.id, 0, {
+						arguments: authoritativeArguments.slice(0, splitAt),
+						id: 'call-delta-only',
+						name: 'call_tool',
+					}),
+					proposalDelta(output.id, 0, {
+						arguments: authoritativeArguments.slice(splitAt),
+						includeIdentity: false,
+					}),
+					pending,
+					turnDone('done-delta-only-1', [pending], output),
+				],
+			},
+			{
+				onCreate: () => addProposal(store, path, content),
+				events: [
+					turnCreated('turn-delta-only-2', 'turn-delta-only-1'),
+					toolResponse('response-delta-only', 'call-delta-only', path),
+					turnDone('done-delta-only-2'),
+				],
+			},
+		]);
+		const approvals: MultiFileToolApprovalRequest[] = [];
+
+		const result = await runMultiFileAgentTurn(
+			scripted.client,
+			'model/fqn',
+			'Prepare a reviewed change.',
+			'delta-only',
+			store,
+			new vscode.CancellationTokenSource().token,
+			{
+				onToolApprovalRequired: async (request) => {
+					approvals.push(request);
+					return { status: 'allow' };
+				},
+			},
+			assembler(),
+		);
+
+		assert.strictEqual(approvals.length, 1);
+		assert.strictEqual(approvals[0].arguments, authoritativeArguments);
+		assert.strictEqual(approvals[0].toolCallId, 'call-delta-only');
+		assert.strictEqual(scripted.requests.length, 2);
+		assert.strictEqual(scripted.requests[1].previousTurnId, 'turn-delta-only-1');
+		assert.strictEqual(result.transaction.status, 'review');
+		assert.strictEqual(result.transaction.changes.size, 1);
+		assert.strictEqual(scripted.cancelCount(), 0);
+	});
+
+	test('processes approval after turn.done without waiting for the stream to close', async () => {
+		const store = new MultiFileProposalStore();
+		begin(store, 'open-approval-stream');
+		const pending = approvalRequired('approval-open', 'message-open', ['call-open']);
+		const output = proposalMessage('message-open', [proposalCall(
+			'call-open',
+			'src/open.ts',
+			'export const continued = true;\n',
+		)]);
+		const streamRemainsOpen = new Promise<void>(() => undefined);
+		const scripted = createScriptedClient([
+			{
+				events: [
+					turnCreated('turn-open-1'),
+					proposalDelta('message-open', 0, {
+						arguments: output.toolCalls?.[0].function.arguments,
+						id: 'call-open',
+						name: 'call_tool',
+					}),
+					pending,
+					turnDone('done-open-1', [pending], output),
+				],
+				waitFor: streamRemainsOpen,
+			},
+			{
+				onCreate: () => addProposal(store, 'src/open.ts', 'export const continued = true;\n'),
+				events: [
+					turnCreated('turn-open-2', 'turn-open-1'),
+					toolResponse('response-open', 'call-open', 'src/open.ts'),
+					turnDone('done-open-2'),
+				],
+			},
+		]);
+		let approvalCount = 0;
+
+		const result = await runMultiFileAgentTurn(
+			scripted.client,
+			'model/fqn',
+			'Prepare a reviewed change.',
+			'open-approval-stream',
+			store,
+			new vscode.CancellationTokenSource().token,
+			{
+				onToolApprovalRequired: async () => {
+					approvalCount += 1;
+					return { status: 'allow' };
+				},
+			},
+			assembler(),
+		);
+
+		assert.strictEqual(approvalCount, 1);
+		assert.strictEqual(scripted.requests.length, 2);
+		assert.deepStrictEqual(scripted.requests[1], {
+			input: [{
+				approval: { status: 'allow' },
+				threadId: 'main',
+				toolCallId: 'call-open',
+				type: 'user.tool_approval',
+			}],
+			previousTurnId: 'turn-open-1',
+		});
+		assert.strictEqual(result.transaction.status, 'review');
+		assert.strictEqual(result.transaction.changes.size, 1);
+		assert.strictEqual(scripted.cancelCount(), 0);
+	});
+
+	for (const rejectionCase of [
+		{
+			expected: /without its source model message/u,
+			name: 'null authoritative turn output',
+			output: null,
+			sourceEventId: 'message-null-output',
+			toolCallId: 'call-null-output',
+		},
+		{
+			expected: /without its source model message/u,
+			name: 'mismatched approval source event',
+			output: proposalMessage('message-source-output', [{ id: 'call-source-mismatch' }]),
+			sourceEventId: 'message-source-requested',
+			toolCallId: 'call-source-mismatch',
+		},
+		{
+			expected: /unknown tool call/u,
+			name: 'mismatched approval tool-call id',
+			output: proposalMessage('message-tool-call-mismatch', [{ id: 'call-output' }]),
+			sourceEventId: 'message-tool-call-mismatch',
+			toolCallId: 'call-requested',
+		},
+		{
+			expected: /unexpected approval request/u,
+			name: 'mismatched MCP server identity',
+			output: proposalMessage(
+				'message-server-mismatch',
+				[{ id: 'call-server-mismatch' }],
+				{ serverName: 'other-workspace-server' },
+			),
+			sourceEventId: 'message-server-mismatch',
+			toolCallId: 'call-server-mismatch',
+		},
+		{
+			expected: /unexpected approval request/u,
+			name: 'mismatched MCP tool identity',
+			output: proposalMessage(
+				'message-tool-mismatch',
+				[{ id: 'call-tool-mismatch' }],
+				{ toolName: 'read_file' },
+			),
+			sourceEventId: 'message-tool-mismatch',
+			toolCallId: 'call-tool-mismatch',
+		},
+	] satisfies Array<{
+		expected: RegExp;
+		name: string;
+		output: TrueForgeApi.ModelMessageEvent | null;
+		sourceEventId: string;
+		toolCallId: string;
+	}>) {
+		test(`rejects delta-only approval with ${rejectionCase.name}`, async () => {
+			const transactionId = `delta-rejection-${rejectionCase.toolCallId}`;
+			const store = new MultiFileProposalStore();
+			begin(store, transactionId);
+			const pending = approvalRequired(
+				`approval-${rejectionCase.toolCallId}`,
+				rejectionCase.sourceEventId,
+				[rejectionCase.toolCallId],
+			);
+			const streamedMessageId = rejectionCase.output?.id ?? rejectionCase.sourceEventId;
+			const scripted = createScriptedClient([{
+				events: [
+					turnCreated(`turn-${rejectionCase.toolCallId}`),
+					proposalDelta(streamedMessageId, 0, {
+						arguments: '{"path":"src/rejected.ts"}',
+						id: rejectionCase.toolCallId,
+						name: 'call_tool',
+					}),
+					pending,
+					turnDone(
+						`done-${rejectionCase.toolCallId}`,
+						[pending],
+						rejectionCase.output,
+					),
+				],
+			}]);
+			let approvalCount = 0;
+
+			await assert.rejects(runMultiFileAgentTurn(
+				scripted.client,
+				'model/fqn',
+				'Prepare a reviewed change.',
+				transactionId,
+				store,
+				new vscode.CancellationTokenSource().token,
+				{
+					onToolApprovalRequired: async () => {
+						approvalCount += 1;
+						return { status: 'allow' };
+					},
+				},
+				assembler(),
+			), rejectionCase.expected);
+
+			assert.strictEqual(approvalCount, 0);
+			assert.strictEqual(scripted.requests.length, 1);
+			assert.strictEqual(scripted.cancelCount(), 1);
+			assert.strictEqual(store.require(transactionId).status, 'cancelled');
+			assert.strictEqual(store.require(transactionId).changes.size, 0);
+		});
+	}
 
 	test('correlates an approved Python proposal after delimiter normalization', async () => {
 		const store = new MultiFileProposalStore();
@@ -706,7 +1205,7 @@ suite('TrueForge propose_write approval flow', () => {
 			new vscode.CancellationTokenSource().token,
 			{ onToolApprovalRequired: async () => ({ status: 'allow' }) },
 			assembler(),
-		), /not produced by an explicitly allowed propose_write execution/u);
+		), /not produced by an explicitly allowed proposal-tool execution/u);
 
 		assert.strictEqual(store.require('mismatched-execution').status, 'cancelled');
 		assert.strictEqual(store.getLastAppliedBatch(), undefined);
@@ -786,6 +1285,338 @@ suite('TrueForge propose_write approval flow', () => {
 		assert.strictEqual(result.transaction.changes.size, 2);
 		assert.strictEqual(result.transaction.status, 'review');
 		assert.strictEqual(store.getLastAppliedBatch(), undefined);
+	});
+
+	test('processes a second sequential approval when the continuation stream release remains pending', async () => {
+		const store = new MultiFileProposalStore();
+		begin(store, 'sequential-open-release');
+		const firstContent = 'export const firstSequential = true;\n';
+		const secondContent = 'export const secondSequential = true;\n';
+		const firstOutput = proposalMessage('message-sequential-first', [proposalCall(
+			'call-sequential-first',
+			'src/sequential-first.ts',
+			firstContent,
+		)]);
+		const secondOutput = proposalMessage('message-sequential-second', [proposalCall(
+			'call-sequential-second',
+			'src/sequential-second.ts',
+			secondContent,
+		)]);
+		const first = approvalRequired(
+			'approval-sequential-first',
+			firstOutput.id,
+			['call-sequential-first'],
+		);
+		const second = approvalRequired(
+			'approval-sequential-second',
+			secondOutput.id,
+			['call-sequential-second'],
+		);
+		const streamReleaseRemainsPending = new Promise<void>(() => undefined);
+		const scripted = createScriptedClient([
+			{
+				events: [
+					turnCreated('turn-sequential-1'),
+					proposalDelta(firstOutput.id, 0, {
+						arguments: firstOutput.toolCalls?.[0].function.arguments,
+						id: 'call-sequential-first',
+						name: 'call_tool',
+					}),
+					first,
+					turnDone('done-sequential-1', [first], firstOutput),
+				],
+			},
+			{
+				onCreate: () => addProposal(store, 'src/sequential-first.ts', firstContent),
+				events: [
+					turnCreated('turn-sequential-2', 'turn-sequential-1'),
+					toolResponse(
+						'response-sequential-first',
+						'call-sequential-first',
+						'src/sequential-first.ts',
+					),
+					readOnlyMessage('message-sequential-read', 'call-sequential-read', 'search_code'),
+					toolResponse(
+						'response-sequential-read',
+						'call-sequential-read',
+						'src/sequential-first.ts',
+					),
+					proposalDelta(secondOutput.id, 0, {
+						arguments: secondOutput.toolCalls?.[0].function.arguments,
+						id: 'call-sequential-second',
+						name: 'call_tool',
+					}),
+					second,
+					turnDone('done-sequential-2', [second], secondOutput),
+				],
+				returnWaitFor: streamReleaseRemainsPending,
+			},
+			{
+				onCreate: () => addProposal(store, 'src/sequential-second.ts', secondContent),
+				events: [
+					turnCreated('turn-sequential-3', 'turn-sequential-2'),
+					toolResponse(
+						'response-sequential-second',
+						'call-sequential-second',
+						'src/sequential-second.ts',
+					),
+					turnDone('done-sequential-3'),
+				],
+			},
+		]);
+		const prompted: string[] = [];
+
+		const result = await runMultiFileAgentTurn(
+			scripted.client,
+			'model/fqn',
+			'Prepare two reviewed changes.',
+			'sequential-open-release',
+			store,
+			new vscode.CancellationTokenSource().token,
+			{
+				onToolApprovalRequired: async (request) => {
+					prompted.push(request.toolCallId);
+					return { status: 'allow' };
+				},
+			},
+			assembler(),
+		);
+
+		assert.deepStrictEqual(prompted, ['call-sequential-first', 'call-sequential-second']);
+		assert.strictEqual(scripted.requests.length, 3);
+		assert.strictEqual(scripted.requests[1].previousTurnId, 'turn-sequential-1');
+		assert.strictEqual(scripted.requests[2].previousTurnId, 'turn-sequential-2');
+		assert.strictEqual(result.transaction.status, 'review');
+		assert.strictEqual(result.transaction.changes.size, 2);
+		assert.strictEqual(store.getLastAppliedBatch(), undefined);
+		assert.strictEqual(scripted.cancelCount(), 0);
+	});
+
+	test('denies the second sequential proposal without storing or applying it', async () => {
+		const store = new MultiFileProposalStore();
+		begin(store, 'sequential-second-denied');
+		const firstContent = 'export const approvedFirst = true;\n';
+		const secondContent = 'export const deniedSecond = true;\n';
+		const firstOutput = proposalMessage('message-denial-first', [proposalCall(
+			'call-denial-first',
+			'src/approved-first.ts',
+			firstContent,
+		)]);
+		const secondOutput = proposalMessage('message-denial-second', [proposalCall(
+			'call-denial-second',
+			'src/denied-second.ts',
+			secondContent,
+		)]);
+		const first = approvalRequired('approval-denial-first', firstOutput.id, ['call-denial-first']);
+		const second = approvalRequired('approval-denial-second', secondOutput.id, ['call-denial-second']);
+		const scripted = createScriptedClient([
+			{
+				events: [
+					turnCreated('turn-denial-1'),
+					proposalDelta(firstOutput.id, 0, {
+						arguments: firstOutput.toolCalls?.[0].function.arguments,
+						id: 'call-denial-first',
+						name: 'call_tool',
+					}),
+					first,
+					turnDone('done-denial-1', [first], firstOutput),
+				],
+			},
+			{
+				onCreate: () => addProposal(store, 'src/approved-first.ts', firstContent),
+				events: [
+					turnCreated('turn-denial-2', 'turn-denial-1'),
+					toolResponse('response-denial-first', 'call-denial-first', 'src/approved-first.ts'),
+					proposalDelta(secondOutput.id, 0, {
+						arguments: secondOutput.toolCalls?.[0].function.arguments,
+						id: 'call-denial-second',
+						name: 'call_tool',
+					}),
+					second,
+					turnDone('done-denial-2', [second], secondOutput),
+				],
+			},
+			{
+				events: [turnCreated('turn-denial-3', 'turn-denial-2'), turnDone('done-denial-3')],
+			},
+		]);
+		const prompted: string[] = [];
+
+		const result = await runMultiFileAgentTurn(
+			scripted.client,
+			'model/fqn',
+			'Prepare two reviewed changes.',
+			'sequential-second-denied',
+			store,
+			new vscode.CancellationTokenSource().token,
+			{
+				onToolApprovalRequired: async (request) => {
+					prompted.push(request.toolCallId);
+					return request.toolCallId === 'call-denial-first'
+						? { status: 'allow' }
+						: { reason: 'The user denied the second proposal.', status: 'deny' };
+				},
+			},
+			assembler(),
+		);
+
+		assert.deepStrictEqual(prompted, ['call-denial-first', 'call-denial-second']);
+		assert.deepStrictEqual(scripted.requests[2].input, [{
+			approval: { reason: 'The user denied the second proposal.', status: 'deny' },
+			threadId: 'main',
+			toolCallId: 'call-denial-second',
+			type: 'user.tool_approval',
+		}]);
+		assert.strictEqual(result.transaction.status, 'review');
+		assert.strictEqual(result.transaction.changes.size, 1);
+		assert.strictEqual(
+			[...result.transaction.changes.values()][0].snapshot.path,
+			'src/approved-first.ts',
+		);
+		assert.strictEqual(store.getLastAppliedBatch(), undefined);
+		assert.strictEqual(scripted.cancelCount(), 0);
+	});
+
+	test('processes three distinct sequential approvals exactly once', async () => {
+		const transactionId = 'three-sequential-approvals';
+		const store = new MultiFileProposalStore();
+		begin(store, transactionId);
+		const decisions = [
+			{ status: 'allow' as const },
+			{ status: 'allow' as const },
+			{ status: 'allow' as const },
+		];
+		const fixture = createSequentialApprovalFixture(store, 'three-sequential', decisions);
+		const prompted: string[] = [];
+		const statusesWhilePrompting: string[] = [];
+
+		const result = await runMultiFileAgentTurn(
+			fixture.client.client,
+			'model/fqn',
+			'Prepare three reviewed changes.',
+			transactionId,
+			store,
+			new vscode.CancellationTokenSource().token,
+			{
+				onToolApprovalRequired: async (request) => {
+					prompted.push(request.toolCallId);
+					statusesWhilePrompting.push(store.require(transactionId).status);
+					return { status: 'allow' };
+				},
+			},
+			assembler(),
+		);
+
+		assert.deepStrictEqual(prompted, fixture.callIds);
+		assert.strictEqual(new Set(prompted).size, 3);
+		assert.deepStrictEqual(statusesWhilePrompting, ['generating', 'generating', 'generating']);
+		assert.strictEqual(fixture.client.requests.length, 4);
+		for (let index = 0; index < fixture.turnIds.length; index += 1) {
+			assert.strictEqual(
+				fixture.client.requests[index + 1].previousTurnId,
+				fixture.turnIds[index],
+			);
+		}
+		assert.strictEqual(result.transaction.status, 'review');
+		assert.deepStrictEqual(
+			[...result.transaction.changes.values()].map((change) => change.snapshot.path).sort(),
+			[...fixture.paths].sort(),
+		);
+		assert.strictEqual(store.getLastAppliedBatch(), undefined);
+		assert.strictEqual(fixture.client.cancelCount(), 0);
+	});
+
+	test('processes four distinct sequential approvals exactly once', async () => {
+		const transactionId = 'four-sequential-approvals';
+		const store = new MultiFileProposalStore();
+		begin(store, transactionId);
+		const decisions = [
+			{ status: 'allow' as const },
+			{ status: 'allow' as const },
+			{ status: 'allow' as const },
+			{ status: 'allow' as const },
+		];
+		const fixture = createSequentialApprovalFixture(store, 'four-sequential', decisions);
+		const callbackCounts = new Map<string, number>();
+
+		const result = await runMultiFileAgentTurn(
+			fixture.client.client,
+			'model/fqn',
+			'Prepare four reviewed changes.',
+			transactionId,
+			store,
+			new vscode.CancellationTokenSource().token,
+			{
+				onToolApprovalRequired: async (request) => {
+					callbackCounts.set(request.toolCallId, (callbackCounts.get(request.toolCallId) ?? 0) + 1);
+					assert.strictEqual(store.require(transactionId).status, 'generating');
+					return { status: 'allow' };
+				},
+			},
+			assembler(),
+		);
+
+		assert.deepStrictEqual(
+			fixture.callIds.map((callId) => callbackCounts.get(callId)),
+			[1, 1, 1, 1],
+		);
+		assert.strictEqual(callbackCounts.size, 4);
+		assert.strictEqual(fixture.client.requests.length, 5);
+		assert.strictEqual(result.transaction.status, 'review');
+		assert.strictEqual(result.transaction.changes.size, 4);
+		assert.deepStrictEqual(
+			[...result.transaction.changes.values()].map((change) => change.snapshot.path).sort(),
+			[...fixture.paths].sort(),
+		);
+		assert.strictEqual(store.getLastAppliedBatch(), undefined);
+		assert.strictEqual(fixture.client.cancelCount(), 0);
+	});
+
+	test('continues to a third proposal after explicitly denying the second', async () => {
+		const transactionId = 'three-sequential-second-denied';
+		const store = new MultiFileProposalStore();
+		begin(store, transactionId);
+		const decisions: TrueForgeApi.ApprovalDecision[] = [
+			{ status: 'allow' },
+			{ reason: 'The user denied the second proposal.', status: 'deny' },
+			{ status: 'allow' },
+		];
+		const fixture = createSequentialApprovalFixture(store, 'three-with-denial', decisions);
+		const prompted: string[] = [];
+
+		const result = await runMultiFileAgentTurn(
+			fixture.client.client,
+			'model/fqn',
+			'Prepare three reviewed changes.',
+			transactionId,
+			store,
+			new vscode.CancellationTokenSource().token,
+			{
+				onToolApprovalRequired: async (request) => {
+					prompted.push(request.toolCallId);
+					return decisions[fixture.callIds.indexOf(request.toolCallId)];
+				},
+			},
+			assembler(),
+		);
+
+		assert.deepStrictEqual(prompted, fixture.callIds);
+		assert.strictEqual(new Set(prompted).size, 3);
+		assert.deepStrictEqual(fixture.client.requests[2].input, [{
+			approval: decisions[1],
+			threadId: 'main',
+			toolCallId: fixture.callIds[1],
+			type: 'user.tool_approval',
+		}]);
+		assert.strictEqual(result.transaction.status, 'review');
+		assert.deepStrictEqual(
+			[...result.transaction.changes.values()].map((change) => change.snapshot.path).sort(),
+			[fixture.paths[0], fixture.paths[2]].sort(),
+		);
+		assert.ok(![...result.transaction.changes.values()]
+			.some((change) => change.snapshot.path === fixture.paths[1]));
+		assert.strictEqual(store.getLastAppliedBatch(), undefined);
+		assert.strictEqual(fixture.client.cancelCount(), 0);
 	});
 
 	test('batches multiple pending calls into one approval continuation', async () => {

@@ -24,6 +24,7 @@ import {
 	type MultiFileTransaction,
 } from '../multiFileEdit/multiFileProposal.js';
 import { ProposeWriteTool } from '../tools/proposeWrite.js';
+import { ProposeEditTool } from '../tools/proposeEdit.js';
 import {
 	MultiFileEditCancelledError,
 	runMultiFileAgentTurn,
@@ -33,6 +34,8 @@ import { WorkspaceBoundary } from '../workspace/workspaceBoundary.js';
 
 class ProposalWorkspaceAdapter implements WorkspaceAdapter {
 	readonly files = new Map<string, string>();
+	readonly openFiles = new Map<string, string>();
+	readonly symbolicLinks = new Set<string>();
 	readCount = 0;
 	readonly root: vscode.WorkspaceFolder = {
 		index: 0,
@@ -40,16 +43,26 @@ class ProposalWorkspaceAdapter implements WorkspaceAdapter {
 		uri: vscode.Uri.file('C:\\agni-multi-file-test\\project'),
 	};
 
-	add(path: string, content: string): void {
-		this.files.set(vscode.Uri.joinPath(this.root.uri, ...path.split('/')).toString(), content);
+	add(path: string, content: string, openContent?: string): void {
+		const uri = vscode.Uri.joinPath(this.root.uri, ...path.split('/')).toString();
+		this.files.set(uri, content);
+		if (openContent !== undefined) {
+			this.openFiles.set(uri, openContent);
+		}
+	}
+
+	addSymbolicLink(path: string, content: string): void {
+		const uri = vscode.Uri.joinPath(this.root.uri, ...path.split('/')).toString();
+		this.files.set(uri, content);
+		this.symbolicLinks.add(uri);
 	}
 
 	findFiles(): Thenable<vscode.Uri[]> {
 		return Promise.resolve([...this.files.keys()].map((value) => vscode.Uri.parse(value)));
 	}
 
-	getOpenDocumentText(): string | undefined {
-		return undefined;
+	getOpenDocumentText(uri: vscode.Uri): string | undefined {
+		return this.openFiles.get(uri.toString());
 	}
 
 	getWorkspaceFolders(): readonly vscode.WorkspaceFolder[] {
@@ -71,7 +84,8 @@ class ProposalWorkspaceAdapter implements WorkspaceAdapter {
 				ctime: 0,
 				mtime: 0,
 				size: Buffer.byteLength(content),
-				type: vscode.FileType.File,
+				type: vscode.FileType.File
+					| (this.symbolicLinks.has(uri.toString()) ? vscode.FileType.SymbolicLink : 0),
 			});
 		}
 		const prefix = `${uri.toString().replace(/\/$/u, '')}/`;
@@ -215,21 +229,23 @@ function threeFileFixture(): {
 }
 
 suite('Autonomous multi-file editing', () => {
-	test('propose_write records three proposals without writing workspace files', async () => {
+	test('propose_edit records three proposals without writing workspace files', async () => {
 		const adapter = new ProposalWorkspaceAdapter();
 		adapter.add('src/one.ts', 'one');
 		adapter.add('src/two.ts', 'two');
 		adapter.add('src/three.ts', 'three');
 		const store = new MultiFileProposalStore();
 		store.begin('Change three files.', 'proposal-tool-transaction');
-		const tool = new ProposeWriteTool(store, new WorkspaceBoundary(adapter));
+		const tool = new ProposeEditTool(store, new WorkspaceBoundary(adapter));
 
-		for (const [path, content] of [
-			['src/one.ts', 'updated one'],
-			['src/two.ts', 'updated two'],
-			['src/three.ts', 'updated three'],
+		for (const [path, oldContent, newContent] of [
+			['src/one.ts', 'one', 'updated one'],
+			['src/two.ts', 'two', 'updated two'],
+			['src/three.ts', 'three', 'updated three'],
 		] as const) {
-			const result = await tool.run({ content, path, root: 'project' });
+			const result = await tool.run({
+				edits: [{ new_str: newContent, old_str: oldContent }], path, root: 'project',
+			});
 			assert.strictEqual(result.isError, undefined);
 		}
 
@@ -237,6 +253,231 @@ suite('Autonomous multi-file editing', () => {
 		assert.strictEqual(adapter.files.get(vscode.Uri.joinPath(adapter.root.uri, 'src', 'one.ts').toString()), 'one');
 		assert.strictEqual(adapter.files.get(vscode.Uri.joinPath(adapter.root.uri, 'src', 'two.ts').toString()), 'two');
 		assert.strictEqual(adapter.files.get(vscode.Uri.joinPath(adapter.root.uri, 'src', 'three.ts').toString()), 'three');
+	});
+
+	test('propose_edit preserves existing code outside a targeted edit', async () => {
+		const adapter = new ProposalWorkspaceAdapter();
+		const original = [
+			'import json',
+			'',
+			'def existing_before():',
+			'    return "before"',
+			'',
+			'def target():',
+			'    return "old"',
+			'',
+			'def existing_after():',
+			'    return "after"',
+			'',
+		].join('\n');
+		const proposed = original.replace('    return "old"', '    return "new"');
+		adapter.add('src/module.py', original);
+		const store = new MultiFileProposalStore();
+		store.begin('Change one function.', 'targeted-proposal');
+		const tool = new ProposeEditTool(store, new WorkspaceBoundary(adapter));
+
+		const result = await tool.run({
+			edits: [{ new_str: '    return "new"', old_str: '    return "old"' }],
+			path: 'src/module.py',
+			root: 'project',
+		});
+		const change = store.require('targeted-proposal').changes.get(
+			multiFileChangeKey('project', 'src/module.py'),
+		);
+
+		assert.strictEqual(result.isError, undefined);
+		assert.strictEqual(change?.snapshot.content, original);
+		assert.strictEqual(change?.proposedContent, proposed);
+		assert.strictEqual(change?.hunks.length, 1);
+		assert.ok(change?.proposedContent.includes('def existing_before():\n    return "before"'));
+		assert.ok(change?.proposedContent.includes('def existing_after():\n    return "after"'));
+		assert.strictEqual(
+			adapter.files.get(vscode.Uri.joinPath(adapter.root.uri, 'src', 'module.py').toString()),
+			original,
+		);
+	});
+
+	test('propose_edit applies one unique match from unsaved editor content', async () => {
+		const adapter = new ProposalWorkspaceAdapter();
+		adapter.add('src/open.ts', 'const value = "saved";\n', 'const value = "unsaved";\n');
+		const store = new MultiFileProposalStore();
+		store.begin('Edit unsaved source.', 'unsaved-edit');
+		const result = await new ProposeEditTool(store, new WorkspaceBoundary(adapter)).run({
+			edits: [{ new_str: 'const value = "updated";', old_str: 'const value = "unsaved";' }],
+			path: 'src/open.ts',
+			root: 'project',
+		});
+		const change = store.require('unsaved-edit').changes.get(
+			multiFileChangeKey('project', 'src/open.ts'),
+		);
+
+		assert.strictEqual(result.isError, undefined);
+		assert.strictEqual(change?.snapshot.content, 'const value = "unsaved";\n');
+		assert.strictEqual(change?.proposedContent, 'const value = "updated";\n');
+	});
+
+	test('propose_edit applies multiple exact replacements in one invocation', async () => {
+		const adapter = new ProposalWorkspaceAdapter();
+		const original = [
+			'export const first = 1;',
+			'export const unchanged = true;',
+			'export const second = 2;',
+			'',
+		].join('\n');
+		adapter.add('src/multiple.ts', original);
+		const store = new MultiFileProposalStore();
+		store.begin('Update two declarations.', 'multiple-exact-edits');
+
+		const result = await new ProposeEditTool(store, new WorkspaceBoundary(adapter)).run({
+			edits: [
+				{ new_str: 'export const first = 10;', old_str: 'export const first = 1;' },
+				{ new_str: 'export const second = 20;', old_str: 'export const second = 2;' },
+			],
+			path: 'src/multiple.ts',
+			root: 'project',
+		});
+		const change = store.require('multiple-exact-edits').changes.get(
+			multiFileChangeKey('project', 'src/multiple.ts'),
+		);
+
+		assert.strictEqual(result.isError, undefined);
+		assert.strictEqual(change?.proposedContent, [
+			'export const first = 10;',
+			'export const unchanged = true;',
+			'export const second = 20;',
+			'',
+		].join('\n'));
+		assert.strictEqual(change?.hunks.length, 2);
+		assert.strictEqual(
+			adapter.files.get(vscode.Uri.joinPath(adapter.root.uri, 'src', 'multiple.ts').toString()),
+			original,
+		);
+	});
+
+	test('propose_edit rejects symbolic links before reading or recording a proposal', async () => {
+		const adapter = new ProposalWorkspaceAdapter();
+		adapter.addSymbolicLink('src/linked.ts', 'export const linked = false;\n');
+		const store = new MultiFileProposalStore();
+		store.begin('Reject a linked target.', 'symbolic-link-edit');
+
+		const result = await new ProposeEditTool(store, new WorkspaceBoundary(adapter)).run({
+			edits: [{ new_str: 'true', old_str: 'false' }],
+			path: 'src/linked.ts',
+			root: 'project',
+		});
+
+		assert.strictEqual(result.isError, true);
+		assert.match(result.content[0]?.text ?? '', /symbolic links are not allowed/iu);
+		assert.strictEqual(adapter.readCount, 0);
+		assert.strictEqual(store.require('symbolic-link-edit').changes.size, 0);
+	});
+
+	test('propose_edit rejects zero and multiple exact matches without recording a proposal', async () => {
+		for (const [transactionId, old_str, expected] of [
+			['zero-match', 'missing()', /did not match/iu],
+			['multiple-match', 'repeat()', /matched more than once/iu],
+		] as const) {
+			const adapter = new ProposalWorkspaceAdapter();
+			adapter.add('src/repeated.ts', 'repeat();\nkeep();\nrepeat();\n');
+			const store = new MultiFileProposalStore();
+			store.begin('Reject ambiguous edit.', transactionId);
+			const result = await new ProposeEditTool(store, new WorkspaceBoundary(adapter)).run({
+				edits: [{ new_str: 'updated()', old_str }],
+				path: 'src/repeated.ts',
+				root: 'project',
+			});
+
+			assert.strictEqual(result.isError, true);
+			assert.match(result.content[0]?.text ?? '', expected);
+			assert.strictEqual(store.require(transactionId).changes.size, 0);
+		}
+	});
+
+	test('propose_edit preserves CRLF outside the exact replacement', async () => {
+		const adapter = new ProposalWorkspaceAdapter();
+		const original = 'first\r\nconst oldValue = 1;\r\nlast\r\n';
+		adapter.add('src/crlf.ts', original);
+		const store = new MultiFileProposalStore();
+		store.begin('Preserve CRLF.', 'crlf-edit');
+		const result = await new ProposeEditTool(store, new WorkspaceBoundary(adapter)).run({
+			edits: [{ new_str: 'const newValue = 2;', old_str: 'const oldValue = 1;' }],
+			path: 'src/crlf.ts',
+			root: 'project',
+		});
+		const change = store.require('crlf-edit').changes.get(multiFileChangeKey('project', 'src/crlf.ts'));
+
+		assert.strictEqual(result.isError, undefined);
+		assert.strictEqual(change?.proposedContent, 'first\r\nconst newValue = 2;\r\nlast\r\n');
+	});
+
+	test('a small propose_edit in a large file produces only a local diff hunk', async () => {
+		const adapter = new ProposalWorkspaceAdapter();
+		const lines = Array.from({ length: 1_200 }, (_, index) => `const line${index + 1} = ${index + 1};`);
+		const original = `${lines.join('\n')}\n`;
+		adapter.add('src/large.ts', original);
+		const store = new MultiFileProposalStore();
+		store.begin('Update one declaration.', 'large-targeted-edit');
+		const result = await new ProposeEditTool(store, new WorkspaceBoundary(adapter)).run({
+			edits: [{ new_str: 'const line600 = 6000;', old_str: 'const line600 = 600;' }],
+			path: 'src/large.ts',
+			root: 'project',
+		});
+		const change = store.require('large-targeted-edit').changes.get(
+			multiFileChangeKey('project', 'src/large.ts'),
+		);
+
+		assert.strictEqual(result.isError, undefined);
+		assert.strictEqual(change?.hunks.length, 1);
+		assert.ok((change?.hunks[0]?.originalText.split(/\r\n|\r|\n/u).length ?? 0) < 20);
+		assert.ok((change?.hunks[0]?.replacementText.split(/\r\n|\r|\n/u).length ?? 0) < 20);
+		assert.ok(change?.proposedContent.startsWith('const line1 = 1;\n'));
+		assert.ok(change?.proposedContent.endsWith('const line1200 = 1200;\n'));
+	});
+
+	test('propose_write rejects an existing file and directs the model to propose_edit', async () => {
+		const adapter = new ProposalWorkspaceAdapter();
+		const original = 'def existing():\n    return "preserved"\n';
+		adapter.add('src/module.py', original);
+		const store = new MultiFileProposalStore();
+		store.begin('Change one function.', 'placeholder-proposal');
+		const tool = new ProposeWriteTool(store, new WorkspaceBoundary(adapter));
+
+		const result = await tool.run({
+			content: 'def replacement():\n    return "new"\n\n[RETAIN EXISTING CODE]\n',
+			path: 'src/module.py',
+			root: 'project',
+		});
+
+		assert.strictEqual(result.isError, true);
+		assert.match(result.content[0]?.text ?? '', /propose_write only creates new files.*propose_edit/iu);
+		assert.strictEqual(store.require('placeholder-proposal').changes.size, 0);
+		assert.strictEqual(
+			adapter.files.get(vscode.Uri.joinPath(adapter.root.uri, 'src', 'module.py').toString()),
+			original,
+		);
+	});
+
+	test('propose_write continues to support complete new-file proposals', async () => {
+		const adapter = new ProposalWorkspaceAdapter();
+		adapter.add('src/existing.ts', 'export const existing = true;\n');
+		const store = new MultiFileProposalStore();
+		store.begin('Create a module.', 'new-file-proposal');
+		const tool = new ProposeWriteTool(store, new WorkspaceBoundary(adapter));
+		const content = 'export function created(): string {\n\treturn "ready";\n}\n';
+
+		const result = await tool.run({ content, path: 'src/created.ts', root: 'project' });
+		const change = store.require('new-file-proposal').changes.get(
+			multiFileChangeKey('project', 'src/created.ts'),
+		);
+
+		assert.strictEqual(result.isError, undefined);
+		assert.strictEqual(result.structuredContent?.created, true);
+		assert.strictEqual(change?.snapshot.exists, false);
+		assert.strictEqual(change?.proposedContent, content);
+		assert.strictEqual(
+			adapter.files.has(vscode.Uri.joinPath(adapter.root.uri, 'src', 'created.ts').toString()),
+			false,
+		);
 	});
 
 	test('propose_write rejects traversal and late proposals', async () => {
@@ -248,13 +489,13 @@ suite('Autonomous multi-file editing', () => {
 		const traversal = await tool.run({ content: 'bad', path: '../outside.ts', root: 'project' });
 		assert.strictEqual(traversal.isError, true);
 
-		await tool.run({ content: 'updated', path: 'src/one.ts', root: 'project' });
+		await tool.run({ content: 'created', path: 'src/new.ts', root: 'project' });
 		store.closeForReview(transaction.id);
-		const late = await tool.run({ content: 'later', path: 'src/one.ts', root: 'project' });
+		const late = await tool.run({ content: 'later', path: 'src/later.ts', root: 'project' });
 		assert.strictEqual(late.isError, true);
 	});
 
-	test('rejects an out-of-plan propose_write before reading the target file', async () => {
+	test('rejects an out-of-plan propose_edit before reading the target file', async () => {
 		const adapter = new ProposalWorkspaceAdapter();
 		adapter.add('src/outside.ts', 'sensitive workspace text');
 		const store = new MultiFileProposalStore();
@@ -263,9 +504,13 @@ suite('Autonomous multi-file editing', () => {
 			'pre-read-scope',
 			[{ path: 'src/approved.ts', root: 'project' }],
 		);
-		const tool = new ProposeWriteTool(store, new WorkspaceBoundary(adapter));
+		const tool = new ProposeEditTool(store, new WorkspaceBoundary(adapter));
 
-		const result = await tool.run({ content: 'replacement', path: 'src/outside.ts', root: 'project' });
+		const result = await tool.run({
+			edits: [{ new_str: 'replacement', old_str: 'sensitive workspace text' }],
+			path: 'src/outside.ts',
+			root: 'project',
+		});
 
 		assert.strictEqual(result.isError, true);
 		assert.strictEqual(adapter.readCount, 0);
@@ -325,9 +570,9 @@ suite('Autonomous multi-file editing', () => {
 		adapter.add('pkg/greetings.py', 'def greet():\r\n    return "hello"\r\n');
 		const store = new MultiFileProposalStore();
 		const transaction = store.begin('Update a Windows path.', 'windows-path');
-		const tool = new ProposeWriteTool(store, new WorkspaceBoundary(adapter));
+		const tool = new ProposeEditTool(store, new WorkspaceBoundary(adapter));
 		const result = await tool.run({
-			content: 'def greet():\n    return "hello, Agni"\n',
+			edits: [{ new_str: '    return "hello, Agni"', old_str: '    return "hello"' }],
 			path: 'pkg\\greetings.py',
 			root: 'project',
 		});

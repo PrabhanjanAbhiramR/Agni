@@ -227,7 +227,7 @@ function panelHtml(webview: vscode.Webview): string {
 			if (message.type === 'status') add('status', message.message);
 			if (message.type === 'proposalState') setProposalState(message.state);
 			if (message.type === 'toolActivity') {
-				const allowedTools = new Set(['read_file', 'list_files', 'search_code', 'propose_write']);
+				const allowedTools = new Set(['read_file', 'list_files', 'search_code', 'propose_edit', 'propose_write']);
 				const statusLabels = {
 					'awaiting-approval': 'awaiting approval',
 					completed: 'completed',

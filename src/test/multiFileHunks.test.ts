@@ -21,6 +21,36 @@ suite('Multi-file hunk generation', () => {
 		);
 	});
 
+	test('splits distant edits despite proposal line-ending normalization', () => {
+		const originalLines = Array.from({ length: 1_136 }, (_, index) => `line ${index + 1}`);
+		const proposedLines = [...originalLines];
+		proposedLines[99] = 'changed near the start';
+		proposedLines[999] = 'changed near the end';
+		const original = `${originalLines.join('\r\n')}\r\n`;
+		const proposed = `${proposedLines.join('\n')}\n`;
+		const hunks = createMultiFileHunks(original, proposed, 'large-crlf-file');
+
+		assert.strictEqual(hunks.length, 2);
+		hunks[0].decision = 'accepted';
+		hunks[1].decision = 'rejected';
+		const materialized = materializeHunkDecisions(original, hunks, false);
+		const expectedLines = [...originalLines];
+		expectedLines[99] = 'changed near the start';
+		assert.strictEqual(materialized, `${expectedLines.join('\r\n')}\r\n`);
+		assert.strictEqual(materialized.includes('changed near the end'), false);
+		assert.strictEqual(materialized.includes('line 500\r\nline 501'), true);
+	});
+
+	test('groups edits to adjacent lines into one review hunk', () => {
+		const original = 'before\nfirst old\nsecond old\nafter\n';
+		const proposed = 'before\nfirst new\nsecond new\nafter\n';
+		const hunks = createMultiFileHunks(original, proposed, 'adjacent-edits');
+
+		assert.strictEqual(hunks.length, 1);
+		hunks[0].decision = 'accepted';
+		assert.strictEqual(materializeHunkDecisions(original, hunks, false), proposed);
+	});
+
 	test('handles insertions and deletions', () => {
 		const insertionOriginal = 'alpha\nomega\n';
 		const insertionProposed = 'alpha\ninserted\nomega\n';

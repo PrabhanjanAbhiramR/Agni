@@ -31,7 +31,7 @@ export class ReadFileTool {
 			}
 
 			const file = await readWorkspaceText(this.boundary, resolved, maxReadBytes);
-			const lines = file.text.split(/\r?\n/);
+			const lines = file.text.split(/\r\n|\r|\n/u);
 			const startLine = input.startLine ?? 1;
 			if (startLine > lines.length) {
 				throw new Error(`startLine ${startLine} exceeds the file's ${lines.length} lines.`);
@@ -45,12 +45,16 @@ export class ReadFileTool {
 			const endLine = Math.min(requestedEnd, startLine + maxReadLines - 1);
 			const truncated = endLine < requestedEnd;
 			const text = lines.slice(startLine - 1, endLine).join('\n');
+			const numberedText = lines
+				.slice(startLine - 1, endLine)
+				.map((line, index) => `${startLine + index}: ${line}`)
+				.join('\n');
 			const displayPath = `${resolved.root.id}/${resolved.relativePath}`;
 
 			return {
 				content: [{
 					type: 'text',
-					text: `File: ${displayPath}\nLines: ${startLine}-${endLine} of ${lines.length}${truncated ? ' (truncated)' : ''}\n\n${text}`,
+					text: `File: ${displayPath}\nLines: ${startLine}-${endLine} of ${lines.length}${truncated ? ' (truncated)' : ''}\n\n${numberedText}`,
 				}],
 				structuredContent: {
 					byteLength: file.byteLength,

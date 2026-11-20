@@ -8,7 +8,10 @@ import {
 import { WorkspaceBoundary } from '../workspace/workspaceBoundary.js';
 import { readWorkspaceText } from '../workspace/workspaceText.js';
 import { type AgniToolResult, errorToolResult } from './toolResult.js';
-import { normalizeGeneratedSourceContent } from './generatedSourceContent.js';
+import {
+	findSourceOmissionPlaceholder,
+	normalizeGeneratedSourceContent,
+} from './generatedSourceContent.js';
 
 export interface ProposeWriteInput {
 	content: string;
@@ -93,6 +96,18 @@ export class ProposeWriteTool {
 				resolved.root.id,
 				resolved.relativePath,
 			);
+			if (snapshot.exists) {
+				throw new Error(
+					'propose_write only creates new files. Use propose_edit for an existing file.',
+				);
+			}
+			const omissionPlaceholder = findSourceOmissionPlaceholder(normalized.content);
+			if (omissionPlaceholder) {
+				throw new Error(
+					`Proposed content contains the source-omission placeholder "${omissionPlaceholder}". `
+					+ 'Read the complete existing file and include every unchanged section verbatim.',
+				);
+			}
 			const change = this.proposals.propose(snapshot, normalized.content);
 			return {
 				content: [{

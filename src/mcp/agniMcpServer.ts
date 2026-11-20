@@ -3,12 +3,13 @@ import * as z from 'zod/v4';
 import { ListFilesTool } from '../tools/listFiles.js';
 import { ReadFileTool } from '../tools/readFile.js';
 import { SearchCodeTool } from '../tools/searchCode.js';
+import { ProposeEditTool } from '../tools/proposeEdit.js';
 import { ProposeWriteTool } from '../tools/proposeWrite.js';
 import { type MultiFileProposalStore } from '../multiFileEdit/multiFileProposal.js';
 import { WorkspaceBoundary } from '../workspace/workspaceBoundary.js';
 
 export const agniWorkspaceToolNames = ['read_file', 'list_files', 'search_code'] as const;
-export const agniMultiFileToolNames = [...agniWorkspaceToolNames, 'propose_write'] as const;
+export const agniMultiFileToolNames = [...agniWorkspaceToolNames, 'propose_edit', 'propose_write'] as const;
 
 const readOnlyAnnotations = {
 	destructiveHint: false,
@@ -79,7 +80,30 @@ export function createAgniMcpServer(
 	);
 
 	if (proposals) {
+		const proposeEdit = new ProposeEditTool(proposals, boundary);
 		const proposeWrite = new ProposeWriteTool(proposals, boundary);
+		server.registerTool(
+			'propose_edit',
+			{
+				annotations: {
+					destructiveHint: false,
+					idempotentHint: false,
+					openWorldHint: false,
+					readOnlyHint: true,
+				},
+				description: 'Propose exact, in-memory replacements to an existing workspace file for user review. Each old_str must occur exactly once in the current file (including unsaved editor text). This tool never writes to the workspace.',
+				inputSchema: z.object({
+					edits: z.array(z.object({
+						new_str: z.string().describe('Exact decoded replacement text.'),
+						old_str: z.string().min(1).describe('Exact current source text that must occur exactly once.'),
+					})).min(1).describe('Small exact replacements, applied in order in memory.'),
+					path: z.string().min(1).describe('Workspace-relative existing file path.'),
+					root: z.string().optional().describe('Workspace root id. Required when multiple workspace folders are open.'),
+				}),
+				title: 'Propose exact workspace edits',
+			},
+			async (input) => proposeEdit.run(input),
+		);
 		server.registerTool(
 			'propose_write',
 			{
@@ -89,13 +113,13 @@ export function createAgniMcpServer(
 					openWorldHint: false,
 					readOnlyHint: true,
 				},
-				description: 'Record decoded UTF-8 source text for user review. JSON transport escaping is handled by the protocol; do not pre-escape source quotes. This tool never writes to the workspace.',
+				description: 'Propose a complete new workspace file for user review. Existing files are rejected and must use propose_edit. JSON transport escaping is handled by the protocol; do not pre-escape source quotes. This tool never writes to the workspace.',
 				inputSchema: z.object({
-					content: z.string().describe('Complete decoded UTF-8 source text. Preserve language-level escapes, but do not add JSON transport escapes.'),
+					content: z.string().describe('Complete decoded UTF-8 source text for a new file, with no omitted sections or placeholders.'),
 					path: z.string().min(1).describe('Workspace-relative file path.'),
 					root: z.string().optional().describe('Workspace root id. Required when multiple workspace folders are open.'),
 				}),
-				title: 'Propose workspace file replacement',
+				title: 'Propose new workspace file',
 			},
 			async (input) => proposeWrite.run(input),
 		);

@@ -3,6 +3,23 @@ export interface NormalizedGeneratedSource {
 	normalizedPythonTripleQuotes: boolean;
 }
 
+const sourceOmissionPlaceholderPatterns = [
+	/\[\s*(?:retain|preserve|keep)\s+(?:all\s+|the\s+)?existing\s+(?:source\s+)?code\s*\]/iu,
+	/\[\s*(?:existing|remaining)\s+(?:source\s+)?code(?:\s+(?:here|unchanged))?\s*\]/iu,
+	/\[\s*(?:rest|remainder)\s+of\s+(?:the\s+)?(?:file|code)(?:\s+(?:here|unchanged|omitted))?\s*\]/iu,
+	/(?:^|\n)\s*(?:(?:#|\/\/|\/\*+|\*+)\s*)?(?:\.\.\.\s*)?(?:rest|remainder|remaining)\s+of\s+(?:the\s+)?(?:file|code)\s+(?:is\s+)?(?:unchanged|omitted)(?:\s*\*\/)?\s*(?=\r?$)/imu,
+] as const;
+
+export function findSourceOmissionPlaceholder(content: string): string | undefined {
+	for (const pattern of sourceOmissionPlaceholderPatterns) {
+		const match = pattern.exec(content);
+		if (match) {
+			return match[0].trim();
+		}
+	}
+	return undefined;
+}
+
 type PythonScanState =
 	| 'code'
 	| 'comment'

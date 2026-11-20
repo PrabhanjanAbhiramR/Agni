@@ -281,6 +281,10 @@ export class MultiFileProposalStore implements vscode.Disposable {
 	}
 
 	materializeAcceptedContent(change: MultiFileChange): string {
+		if (change.hunks.length > 0
+			&& change.hunks.every((hunk) => hunk.decision === 'accepted')) {
+			return change.proposedContent;
+		}
 		return materializeHunkDecisions(change.snapshot.content, change.hunks, false);
 	}
 

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { diffLines } from 'diff';
+import { diffArrays } from 'diff';
 
 export type MultiFileHunkDecision = 'pending' | 'accepted' | 'rejected';
 
@@ -10,6 +10,48 @@ export interface MultiFileHunk {
 	originalStart: number;
 	originalText: string;
 	replacementText: string;
+}
+
+interface TextLine {
+	canonical: string;
+	end: number;
+	start: number;
+}
+
+function textLines(content: string): TextLine[] {
+	const lines: TextLine[] = [];
+	let start = 0;
+	for (let index = 0; index < content.length; index += 1) {
+		if (content[index] !== '\n' && content[index] !== '\r') {
+			continue;
+		}
+		const terminatorLength = content[index] === '\r' && content[index + 1] === '\n' ? 2 : 1;
+		const end = index + terminatorLength;
+		lines.push({
+			canonical: `${content.slice(start, index)}\n`,
+			end,
+			start,
+		});
+		start = end;
+		index = end - 1;
+	}
+	if (start < content.length) {
+		lines.push({ canonical: content.slice(start), end: content.length, start });
+	}
+	return lines;
+}
+
+function lineOffset(lines: readonly TextLine[], index: number, contentLength: number): number {
+	return lines[index]?.start ?? contentLength;
+}
+
+function preferredEol(content: string, fallback: string): string {
+	const match = content.match(/\r\n|\n|\r/u) ?? fallback.match(/\r\n|\n|\r/u);
+	return match?.[0] ?? '\n';
+}
+
+function withEol(content: string, eol: string): string {
+	return content.replace(/\r\n|\n|\r/gu, eol);
 }
 
 function hunkId(
@@ -38,9 +80,16 @@ export function createMultiFileHunks(
 	proposedContent: string,
 	identity: string,
 ): MultiFileHunk[] {
-	const parts = diffLines(originalContent, proposedContent);
+	const originalLines = textLines(originalContent);
+	const proposedLines = textLines(proposedContent);
+	const parts = diffArrays(
+		originalLines.map((line) => line.canonical),
+		proposedLines.map((line) => line.canonical),
+	);
 	const hunks: MultiFileHunk[] = [];
-	let originalOffset = 0;
+	const replacementEol = preferredEol(originalContent, proposedContent);
+	let originalLine = 0;
+	let proposedLine = 0;
 	let currentStart: number | undefined;
 	let replacementText = '';
 
@@ -48,7 +97,7 @@ export function createMultiFileHunks(
 		if (currentStart === undefined) {
 			return;
 		}
-		const originalEnd = originalOffset;
+		const originalEnd = lineOffset(originalLines, originalLine, originalContent.length);
 		const originalText = originalContent.slice(currentStart, originalEnd);
 		hunks.push({
 			decision: 'pending',
@@ -65,17 +114,37 @@ export function createMultiFileHunks(
 	for (const part of parts) {
 		if (!part.added && !part.removed) {
 			flush();
-			originalOffset += part.value.length;
+			originalLine += part.value.length;
+			proposedLine += part.value.length;
 			continue;
 		}
-		currentStart ??= originalOffset;
+		currentStart ??= lineOffset(originalLines, originalLine, originalContent.length);
 		if (part.removed) {
-			originalOffset += part.value.length;
+			originalLine += part.value.length;
 		} else if (part.added) {
-			replacementText += part.value;
+			const proposedStart = lineOffset(proposedLines, proposedLine, proposedContent.length);
+			proposedLine += part.value.length;
+			const proposedEnd = lineOffset(proposedLines, proposedLine, proposedContent.length);
+			replacementText += withEol(
+				proposedContent.slice(proposedStart, proposedEnd),
+				replacementEol,
+			);
 		}
 	}
 	flush();
+
+	// A proposal that changes only line endings is still a real proposal. Keep it
+	// reviewable as one hunk; ordinary source edits use the EOL-equivalent line diff above.
+	if (hunks.length === 0 && originalContent !== proposedContent) {
+		return [{
+			decision: 'pending',
+			id: hunkId(identity, 0, originalContent.length, originalContent, proposedContent),
+			originalEnd: originalContent.length,
+			originalStart: 0,
+			originalText: originalContent,
+			replacementText: proposedContent,
+		}];
+	}
 
 	if (hunks.length === 0 && originalContent === proposedContent && originalContent.length === 0) {
 		return [{

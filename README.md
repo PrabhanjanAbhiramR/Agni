@@ -16,12 +16,31 @@ Agni does not write files while TrueForge is generating a proposal. Accepted edi
 
 ## Requirements
 
+- Node.js 22.14 or later and npm.
 - VS Code 1.144 or later.
-- A TrueForge server reachable from the Extension Host. The default is `http://localhost:8790`.
+- A running TrueForge server reachable from the Extension Host. The default is `http://localhost:8790`.
 - At least one model configured in that TrueForge server.
 - A trusted VS Code workspace for workspace tools and editing features.
 
 Agni routes model operations through TrueForge and does not call Gemini or another model provider directly.
+
+## Local TrueForge setup
+
+Follow the [TrueForge quickstart](https://trueforge.dev/quickstart) and start the
+local runtime from PowerShell:
+
+```powershell
+npx @truefoundry/trueforge@latest
+```
+
+Open the UI at the URL printed by TrueForge (typically
+`http://localhost:8790`) and configure a model there. Provider credentials stay
+in TrueForge and are not stored by Agni. The repository contains no API keys.
+
+The credential-free [`trueforge/model.example.json`](trueforge/model.example.json)
+shows the server URL and model-FQN values used by the registration workflow.
+Use the exact model FQN returned by TrueForge; do not guess or substitute a
+provider model identifier.
 
 ## Standalone TrueForge agent definition
 
@@ -37,7 +56,8 @@ shows the credential-free server URL and model-FQN inputs used for registration.
 Configure provider credentials in the local TrueForge server, never in this
 repository.
 
-To register or update the named agent:
+To register or update [`trueforge/agni-agent.json`](trueforge/agni-agent.json)
+as the named agent:
 
 1. Start the local TrueForge server and configure a model in it.
 2. Run **Agni: Test TrueForge Connection** and copy the exact model FQN shown by
@@ -89,6 +109,59 @@ modify those runtime flows.
 
 The **Agni Review** view in the Explorer contains file and hunk review actions for active multi-file proposals.
 
+## Launch and configure Agni
+
+Install dependencies and compile the extension:
+
+```powershell
+npm ci
+npm run compile
+```
+
+Open the repository in VS Code and press `F5`. The checked-in **Run Extension**
+configuration compiles Agni and opens a separate Extension Development Host.
+Open and trust the workspace that Agni should inspect in that Development Host.
+
+Configure these exact VS Code settings when their defaults are not suitable:
+
+- `agni.trueForge.serverUrl`: the TrueForge server base URL; defaults to
+  `http://localhost:8790`.
+- `agni.trueForge.selectedModel`: an exact configured TrueForge model FQN to
+  preselect in model pickers.
+- `agni.context.maxBytes`: the assembled-context byte budget.
+
+Run **Agni: Test TrueForge Connection** to list the models configured in the
+server and select one. Run **Agni: Test Workspace Tools** if you want to verify
+the authenticated workspace MCP connector before an agent task.
+
+## Agent Panel and reviewed edits
+
+Open the Explorer and expand **Agni Agent**. Enter a natural-language task in
+the chat input; Agni assembles relevant workspace context, displays the selected
+files and reasons, and sends the task through TrueForge. The model may use the
+authenticated `read_file`, `list_files`, and `search_code` MCP tools to discover
+additional code.
+
+For an existing file, the agent must use `propose_edit` with exact text
+replacements. For a new file, it must use `propose_write` with the complete new
+file content. `propose_write` rejects existing files. Both tools create only
+in-memory proposals and never write directly to the workspace.
+
+TrueForge tool approval and final edit application are separate safety gates:
+
+1. **Allow Proposal** permits TrueForge to execute `propose_edit` or
+   `propose_write` and record an in-memory proposal. **Deny** prevents that tool
+   execution. Allowing a tool does not modify a workspace file.
+2. Review each proposed file and hunk under **Agni Review**. Use the file and
+   hunk Accept/Reject actions or the CodeLens actions above proposed hunks.
+3. Run **Agni: Apply Reviewed Changes** to apply only accepted hunks through one
+   guarded VS Code `WorkspaceEdit`. Stale files are rejected rather than
+   overwritten.
+4. Run **Agni: Reject Multi-File Edit** to discard the active proposal without
+   writing files.
+5. After an application, run **Agni: Undo Last Multi-File Edit** for the guarded,
+   stale-aware rollback.
+
 ## Planning Mode
 
 Run **Agni: Multi-File Edit** and enter the task normally. Agni first uses the
@@ -98,8 +171,9 @@ dependencies, and risks. Review that plan in the **Agni** output channel and
 approve it in the modal confirmation before implementation starts.
 
 The approved plan—not only the original task—is sent to the implementation
-agent. `propose_write` is restricted to the approved workspace-root/file pairs,
-and Agni validates the same scope again before applying reviewed edits. If the
+agent. Both `propose_edit` and `propose_write` are restricted to the approved
+workspace-root/file pairs, and Agni validates the same scope again before
+applying reviewed edits. If the
 implementation discovers that another file is required, the run stops without
 recording that out-of-scope proposal; start Multi-File Edit again to review and
 approve a revised plan. Cancelling either model-execution phase cancels its
@@ -136,6 +210,13 @@ npm test
 ```
 
 Press `F5` in VS Code to open an Extension Development Host with the current project loaded.
+
+## Project origin and licensing
+
+Agni was built from scratch and is not an upstream fork. Agni's original code
+is licensed under Apache License 2.0; see [`LICENSE`](LICENSE). Required
+third-party attributions are listed in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Release status
 
